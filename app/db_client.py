@@ -5,30 +5,48 @@ import os
 
 class ChromaClient:
     def __init__(self, client_settings=None):
-        """
-        New-style chromadb client wrapper.
-        If client_settings contains 'persist_directory', we'll use PersistentClient(path=...)
-        Otherwise we create a regular in-memory client via chromadb.Client().
-        """
-        persist_dir = None
-        if client_settings and 'persist_directory' in client_settings:
-            persist_dir = client_settings['persist_directory']
+        # """
+        # New-style chromadb client wrapper.
+        # If client_settings contains 'persist_directory', we'll use PersistentClient(path=...)
+        # Otherwise we create a regular in-memory client via chromadb.Client().
+        # """
+        # persist_dir = None
+        # if client_settings and 'persist_directory' in client_settings:
+        #     persist_dir = client_settings['persist_directory']
 
-        if persist_dir:
-            # ensure directory exists
-            os.makedirs(persist_dir, exist_ok=True)
-            try:
-                # PersistentClient is the new API for disk persistence
-                self.client = chromadb.PersistentClient(path=persist_dir)
-            except Exception as e:
-                # fallback to plain Client to surface helpful error
-                raise RuntimeError(f"Failed to create PersistentClient at {persist_dir}: {e}")
+        # if persist_dir:
+        #     # ensure directory exists
+        #     os.makedirs(persist_dir, exist_ok=True)
+        #     try:
+        #         # PersistentClient is the new API for disk persistence
+        #         self.client = chromadb.PersistentClient(path=persist_dir)
+        #     except Exception as e:
+        #         # fallback to plain Client to surface helpful error
+        #         raise RuntimeError(f"Failed to create PersistentClient at {persist_dir}: {e}")
+        # else:
+        #     # in-memory client
+        #     self.client = chromadb.Client()
+
+        # # Use a single collection instance; create if not exists
+        # self.collection = None
+
+        
+        api_key = os.getenv("CHROMA_API_KEY")
+        tenant = os.getenv("CHROMA_TENANT")
+        database = os.getenv("CHROMA_DATABASE", "RAKR")
+
+        if api_key and tenant:
+            # Chroma Cloud
+            self.client = chromadb.CloudClient(
+                api_key=api_key,
+                tenant=tenant,
+                database=database
+            )
         else:
-            # in-memory client
-            self.client = chromadb.Client()
+            raise RuntimeError("Chroma Cloud credentials missing")
 
-        # Use a single collection instance; create if not exists
         self.collection = None
+
 
     def ensure_collection(self, name="ragr"):
         if self.collection is None:

@@ -92,6 +92,15 @@ async def upload_file(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
     return {"status":"uploaded", "filename": str(dest)}
 
+def file_already_ingested(filename: str) -> bool:
+    try:
+        # Try fetching one chunk from this file
+        res = db.collection.get(where={"source": filename}, limit=1)
+        return len(res.get("ids", [])) > 0
+    except Exception:
+        return False
+
+
 @app.post('/ingest')
 def ingest():
     if rag is None:
@@ -100,6 +109,9 @@ def ingest():
     files = list(UPLOAD_DIR.iterdir())
     added = 0
     for f in files:
+        if file_already_ingested(f.name):
+            LOG.info(f"Skipping already ingested file: {f.name}")
+            continue
         parsed = parse_file(str(f))
         chunks = chunk_texts(parsed["content"], max_tokens=int(os.getenv("MAX_CHUNK_TOKENS",500)))
         docs = []

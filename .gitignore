@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+myenv/
+pip-wheel-metadata/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs and reports
+*.log
+logs/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+secrets.json
+
+# Databases and persistent stores
+*.sqlite3
+chroma_db/
+uploaded/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.sublime-*
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Caches / model downloads
+.cache/
+transformers_cache/
+huggingface/
+sentence_transformers_cache/
+
+# Frontend
+node_modules/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

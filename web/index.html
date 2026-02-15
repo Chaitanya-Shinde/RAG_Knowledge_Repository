@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>RAKR — Chat</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width:800px; margin:20px auto; }
+    #chat { border:1px solid #ddd; padding:10px; height:400px; overflow:auto; }
+    .user { text-align:right; color: white; background:#007bff; padding:6px; margin:6px; border-radius:8px; display:inline-block;}
+    .bot { text-align:left; background:#f1f1f1; padding:6px; margin:6px; border-radius:8px; display:inline-block;}
+  </style>
+</head>
+<body>
+  <h1>RAKR — Chat UI (minimal)</h1>
+  <div>
+    <input id="prompt" style="width:70%" placeholder="Ask a question..."/>
+    <button onclick="send()">Send</button>
+  </div>
+  <div id="chat"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

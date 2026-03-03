@@ -56,3 +56,6 @@ node_modules/
 *.tmp
 *.bak
 *.swp
+
+# google client secret
+credentials.json  

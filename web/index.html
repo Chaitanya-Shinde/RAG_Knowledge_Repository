@@ -12,6 +12,13 @@
 </head>
 <body>
   <h1>RAKR — Chat UI (minimal)</h1>
+
+  <h3>Upload Document</h3>
+  <input type="file" id="fileInput" />
+  <button onclick="uploadAndIngest()">Upload</button>
+  <p id="uploadStatus"></p>
+
+  
   <div>
     <input id="prompt" style="width:70%" placeholder="Ask a question..."/>
     <button onclick="send()">Send</button>
@@ -19,5 +26,5 @@
   <div id="chat"></div>
 
   <script src="app.js"></script>
-</body>
+</body> 
 </html>

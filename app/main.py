@@ -1,10 +1,13 @@
 # app/main.py  (replace your existing file with this)
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import os, shutil, logging
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi.staticfiles import StaticFiles
+from app.drive.drive_service import get_drive_service, upload_file_to_drive
+
+
 
 
 load_dotenv()
@@ -21,6 +24,7 @@ UPLOAD_DIR = Path("./uploaded")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="RAKR - Retrieval-Augmented Knowledge Repo")
+
 
 
 # app/main.py (snippet to add near top, after `app = FastAPI(...)`)
@@ -41,6 +45,10 @@ app.add_middleware(
 embed_model = None
 db = None
 rag = None
+
+from app.auth.google_auth import router as google_auth_router
+
+app.include_router(google_auth_router, prefix="/auth")
 
 @app.on_event("startup")
 def startup_event():
@@ -85,12 +93,38 @@ def health():
     status = {"status": "ok", "embed_model_loaded": bool(embed_model), "db_ready": bool(db), "rag_ready": bool(rag)}
     return status
 
-@app.post('/upload')
+from app.auth.google_auth import user_store
+
+@app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    dest = UPLOAD_DIR / file.filename
-    with open(dest, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return {"status":"uploaded", "filename": str(dest)}
+    try:
+        user = user_store.get("current_user")
+
+        if not user:
+            raise HTTPException(status_code=401, detail="User not authenticated")
+
+        drive_service = get_drive_service(
+            access_token=user["access_token"],
+            refresh_token=user["refresh_token"],
+            client_id=os.getenv("GOOGLE_CLIENT_ID"),
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+        )
+
+        file_id = upload_file_to_drive(
+            drive_service,
+            file,
+            file.filename,
+            user["folder_id"],
+        )
+
+        return {
+            "status": "uploaded_to_drive",
+            "filename": file.filename,
+            "drive_file_id": file_id,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 def file_already_ingested(filename: str) -> bool:
     try:

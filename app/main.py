@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     #allow_origins=["*"],            # change to your frontend origin in prod
-    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -182,7 +182,10 @@ async def ingest(user=Depends(get_current_user)):
             collection.add(
                 documents=chunks,
                 embeddings=embeddings,
-                metadatas=[{"source": filename}] * len(chunks),
+                metadatas=[
+                    {"source": filename, "chunk_index": i}
+                    for i in range(len(chunks))
+                ],
                 ids=[f"{filename}_{i}" for i in range(len(chunks))]
             )
 
@@ -195,18 +198,91 @@ async def ingest(user=Depends(get_current_user)):
 @app.post('/query')
 async def query(
     prompt: str = Form(...),
-    k: int = Form(15),
+    model: str = Form("gemini"),
+    k: int = Form(10),
     user=Depends(get_current_user)
 ):
     if embed_model is None:
         return JSONResponse({"error": "Embedding model not initialized"}, status_code=500)
 
-    result = rag.answer(prompt,user["google_id"], k)
+    result = rag.answer(prompt,user["google_id"], k, model)
 
     return JSONResponse({
         "answer": result["answer"],
         "sources": result["sources"]
     })
+
+@app.get("/documents")
+async def list_documents(user=Depends(get_current_user)):
+
+    drive_service = get_drive_service(user["refresh_token"])
+
+    results = drive_service.files().list(
+        q=f"'{user['drive_folder_id']}' in parents and trashed=false",
+        fields="files(id, name, size)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    collection = db.get_user_collection(user["google_id"])
+
+    documents = []
+
+    for f in files:
+        filename = f["name"]
+
+        try:
+            res = collection.get(where={"source": filename})
+            chunk_count = len(res.get("ids", []))
+        except:
+            chunk_count = 0
+
+        documents.append({
+            "filename": filename,
+            "chunks": chunk_count
+        })
+
+    return {"documents": documents}
+
+@app.delete("/documents/{filename}")
+async def delete_document(filename: str, user=Depends(get_current_user)):
+
+    drive_service = get_drive_service(user["refresh_token"])
+
+    # Find file in Drive
+    results = drive_service.files().list(
+        q=f"name='{filename}' and '{user['drive_folder_id']}' in parents and trashed=false",
+        fields="files(id, name)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    if not files:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_id = files[0]["id"]
+
+    # Delete from Drive
+    drive_service.files().delete(fileId=file_id).execute()
+
+    # Delete vectors
+    collection = db.get_user_collection(user["google_id"])
+
+    collection.delete(
+        where={"source": filename}
+    )
+
+    return {
+        "status": "deleted",
+        "filename": filename
+    }
+
+@app.get("/me")
+def me(user=Depends(get_current_user)):
+    return {
+        "email": user["email"],
+        "name": user["name"]
+    }
 
 # Serve frontend
 app.mount("/", StaticFiles(directory="web", html=True), name="web")

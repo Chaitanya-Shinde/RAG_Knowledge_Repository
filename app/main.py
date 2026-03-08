@@ -1,11 +1,14 @@
 # app/main.py  (replace your existing file with this)
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 import os, shutil, logging
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi.staticfiles import StaticFiles
-from app.drive.drive_service import get_drive_service, upload_file_to_drive
+from app.drive.drive_service import get_drive_service, upload_file_to_drive, stream_file_from_drive
+from app.db.mongo import users_collection
+from app.auth.jwt_handler import verify_token
+from app.auth.dependencies import get_current_user
 
 
 
@@ -93,28 +96,21 @@ def health():
     status = {"status": "ok", "embed_model_loaded": bool(embed_model), "db_ready": bool(db), "rag_ready": bool(rag)}
     return status
 
-from app.auth.google_auth import user_store
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user)
+):
     try:
-        user = user_store.get("current_user")
 
-        if not user:
-            raise HTTPException(status_code=401, detail="User not authenticated")
-
-        drive_service = get_drive_service(
-            access_token=user["access_token"],
-            refresh_token=user["refresh_token"],
-            client_id=os.getenv("GOOGLE_CLIENT_ID"),
-            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-        )
+        drive_service = get_drive_service(user["refresh_token"])
 
         file_id = upload_file_to_drive(
             drive_service,
             file,
-            file.filename,
-            user["folder_id"],
+            file.filename, 
+            user["drive_folder_id"],
         )
 
         return {
@@ -126,46 +122,91 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def file_already_ingested(filename: str) -> bool:
+def file_already_ingested(collection, filename: str) -> bool:
     try:
         # Try fetching one chunk from this file
-        res = db.collection.get(where={"source": filename}, limit=1)
+        res = collection.get(where={"source": filename}, limit=1)
         return len(res.get("ids", [])) > 0
     except Exception:
         return False
 
 
-@app.post('/ingest')
-def ingest():
-    if rag is None:
-        return JSONResponse({"error": "RAG system not initialized"}, status_code=500)
 
-    files = list(UPLOAD_DIR.iterdir())
-    added = 0
-    for f in files:
-        if file_already_ingested(f.name):
-            LOG.info(f"Skipping already ingested file: {f.name}")
-            continue
-        parsed = parse_file(str(f))
-        chunks = chunk_texts(parsed["content"], max_tokens=int(os.getenv("MAX_CHUNK_TOKENS",500)))
-        docs = []
-        for i,c in enumerate(chunks):
-            docs.append({
-                "id": f"{f.name}::chunk_{i}",
-                "text": c,
-                "metadata": {"source": str(f.name)}
-            })
-        rag.index_documents(docs)
-        added += len(docs)
-    return {"status":"ingested", "documents_added": added}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+@app.post("/ingest")
+async def ingest(user=Depends(get_current_user)):
+    try:
+        drive_service = get_drive_service(user["refresh_token"])
+
+        results = drive_service.files().list(
+            q=f"'{user['drive_folder_id']}' in parents and trashed=false",
+            fields="files(id, name, size)"
+        ).execute()
+
+        files = results.get("files", [])
+
+        if not files:
+            return {"message": "No files found in Drive folder."}
+
+        collection = db.get_user_collection(user["google_id"])
+
+        for file in files:
+            file_id = file["id"]
+            filename = file["name"]
+            size = int(file.get("size", 0))
+
+            # 🔒 1️⃣ File size validation
+            if size > MAX_FILE_SIZE:
+                print(f"Skipping {filename} — too large.")
+                continue
+
+            # 🔁 Skip already ingested files
+            if file_already_ingested(collection, filename):
+                continue
+
+            print(f"Ingesting {filename}...")
+
+            # 📥 2️⃣ Stream file from Drive (no disk)
+            file_stream = stream_file_from_drive(drive_service, file_id)
+
+            # 📝 3️⃣ Parse in memory
+            text = parse_file(file_stream, filename)
+
+            # ✂ 4️⃣ Chunk immediately
+            chunks = chunk_texts(text)
+
+            # 🧠 5️⃣ Embed immediately
+            embeddings = embed_model.embed_documents(chunks)
+
+            # 💾 6️⃣ Store in per-user collection
+            collection.add(
+                documents=chunks,
+                embeddings=embeddings,
+                metadatas=[{"source": filename}] * len(chunks),
+                ids=[f"{filename}_{i}" for i in range(len(chunks))]
+            )
+
+        return {"message": "Ingestion complete."}
+
+    except Exception as e:
+        print("INGEST ERROR:", e)
+        raise
 
 @app.post('/query')
-async def query(prompt: str = Form(...), k: int = Form(5)):
-    if rag is None:
-        return JSONResponse({"error": "RAG system not initialized"}, status_code=500)
-    result = rag.answer(prompt, top_k=k)
-    return JSONResponse(result)
+async def query(
+    prompt: str = Form(...),
+    k: int = Form(15),
+    user=Depends(get_current_user)
+):
+    if embed_model is None:
+        return JSONResponse({"error": "Embedding model not initialized"}, status_code=500)
 
+    result = rag.answer(prompt,user["google_id"], k)
+
+    return JSONResponse({
+        "answer": result["answer"],
+        "sources": result["sources"]
+    })
 
 # Serve frontend
 app.mount("/", StaticFiles(directory="web", html=True), name="web")

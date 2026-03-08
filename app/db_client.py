@@ -68,3 +68,8 @@ class ChromaClient:
         # request top-n results using the new API
         results = col.query(query_embeddings=[query_embedding], n_results=n)
         return results
+
+    def get_user_collection(self, google_id: str):
+        return self.client.get_or_create_collection(
+            name=f"user_{google_id}"
+        )

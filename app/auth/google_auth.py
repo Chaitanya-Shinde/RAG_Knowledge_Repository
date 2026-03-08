@@ -1,13 +1,17 @@
 from fastapi import APIRouter, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from google_auth_oauthlib.flow import Flow
 from app.drive.drive_service import get_drive_service, get_or_create_rag_folder
+from app.db.mongo import users_collection
 import os
+from google.oauth2 import id_token
+from google.auth.transport import requests
+from app.auth.jwt_handler import create_access_token
 
 router = APIRouter()
 
 flow_store = {}
-user_store = {}
+
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -57,17 +61,56 @@ def callback(request: Request):
 
     credentials = flow.credentials
 
-    drive_service = get_drive_service(
-        credentials.token,
-        credentials.refresh_token,
-        os.getenv("GOOGLE_CLIENT_ID"),
-        os.getenv("GOOGLE_CLIENT_SECRET")
+    id_info = id_token.verify_oauth2_token(
+        credentials.id_token,
+        requests.Request(),
+        os.getenv("GOOGLE_CLIENT_ID")
     )
+
+    google_id = id_info["sub"]
+    email = id_info["email"]
+    name = id_info.get("name")
+
+    drive_service = get_drive_service(credentials.refresh_token)
 
     folder_id = get_or_create_rag_folder(drive_service)
 
-    user_store["current_user"] = {
-    "access_token": credentials.token,
-    "refresh_token": credentials.refresh_token,
-    "folder_id": folder_id
-    }
+    users_collection.update_one(
+        {"google_id": google_id},
+        {
+            "$set": {
+                "email": email,
+                "name": name,
+                "drive_folder_id": folder_id,
+                "refresh_token": credentials.refresh_token,
+            }
+        },
+        upsert=True
+    )
+
+    jwt_token = create_access_token({"google_id": google_id})
+
+    response = RedirectResponse(url="http://localhost:8000")  # your frontend
+
+    
+    response.set_cookie(
+        key="access_token",
+        value=jwt_token,
+        httponly=True,
+        secure=False,   # set True in production (HTTPS)
+        samesite="lax"
+    )
+
+    
+    # return {
+    #   "access_token": jwt_token,
+    #   "user": {
+    #       "message": "User authenticated and stored",
+    #       "google_id": google_id,
+    #       "email": email,
+    #       "name": name,
+    #       "folder_id": folder_id
+    #   }
+    # }
+    
+    return response

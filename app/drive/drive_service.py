@@ -1,16 +1,21 @@
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from googleapiclient.http import MediaIoBaseUpload
+from dotenv import load_dotenv
 import io
+import os
+from googleapiclient.http import MediaIoBaseDownload
+
+load_dotenv()
 
 
-def get_drive_service(access_token, refresh_token, client_id, client_secret):
+def get_drive_service(refresh_token):
     creds = Credentials(
-        token=access_token,
+        None,  # access token will be refreshed automatically
         refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
     )
 
     service = build("drive", "v3", credentials=creds)
@@ -57,3 +62,15 @@ def upload_file_to_drive(service, file, filename, folder_id):
     ).execute()
 
     return uploaded_file.get("id")
+
+def stream_file_from_drive(service, file_id):
+    request = service.files().get_media(fileId=file_id)
+    file_stream = io.BytesIO()
+    downloader = MediaIoBaseDownload(file_stream, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    file_stream.seek(0)
+    return file_stream

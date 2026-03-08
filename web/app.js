@@ -1,5 +1,3 @@
-const API_BASE = "http://127.0.0.1:8000";
-
 /* ---------------- CHAT ---------------- */
 
 async function send() {
@@ -13,9 +11,10 @@ async function send() {
   form.append('k', 5);
 
   try {
-    const res = await fetch(API_BASE + '/query', {
+    const res = await fetch('/query', {
       method: 'POST',
-      body: form
+      body: form,
+      credentials: 'include'   // IMPORTANT for HttpOnly cookie
     });
 
     if (!res.ok) {
@@ -63,9 +62,10 @@ async function uploadAndIngest() {
     status.innerText = "Uploading file...";
 
     // 1️⃣ Upload file
-    const uploadRes = await fetch(API_BASE + "/upload", {
+    const uploadRes = await fetch("/upload", {
       method: "POST",
-      body: formData
+      body: formData,
+      credentials: "include"   // IMPORTANT for auth cookie
     });
 
     if (!uploadRes.ok) {
@@ -78,8 +78,9 @@ async function uploadAndIngest() {
     status.innerText = "File uploaded. Ingesting...";
 
     // 2️⃣ Trigger ingestion
-    const ingestRes = await fetch(API_BASE + "/ingest", {
-      method: "POST"
+    const ingestRes = await fetch("/ingest", {
+      method: "POST",
+      credentials: "include"   // IMPORTANT for auth cookie
     });
 
     if (!ingestRes.ok) {
@@ -87,12 +88,11 @@ async function uploadAndIngest() {
       return;
     }
 
-    const ingestData = await ingestRes.json();
+    await ingestRes.json();
 
     status.innerText =
       `✅ ${uploadData.filename} uploaded and ingested successfully!`;
 
-    // Optional: clear file input
     fileInput.value = "";
 
   } catch (err) {

@@ -8,7 +8,14 @@ import google.generativeai as genai
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATE = '''You are a helpful assistant. Use ONLY the context given below to answer the question. Provide concise answer and list sources at the end.
+PROMPT_TEMPLATE = """
+You are a helpful assistant.
+
+Use ONLY the context below to answer the question.
+
+If the context contains questions, list them exactly as written.
+
+Do NOT summarize or invent information.
 
 CONTEXT:
 {context}
@@ -16,8 +23,10 @@ CONTEXT:
 QUESTION:
 {question}
 
+Return the answer as a numbered list when possible.
+
 ANSWER:
-'''
+"""
 
 class RAGSystem:
     def __init__(self, embed_model: EmbeddingModel, db_client: ChromaClient):
@@ -40,42 +49,76 @@ class RAGSystem:
         logger.info(f"Indexed {len(docs)} documents")
         return {"indexed": len(docs)}
 
-    def retrieve(self, query, k=5):
+    def retrieve(self, query, google_id, k=5):
         q_emb = self.embed_model.embed_query(query)
-        res = self.db.query(q_emb, n=k)
+
+        collection = self.db.get_user_collection(google_id)
+
+        res = collection.query(
+            query_embeddings=[q_emb],
+            n_results=k
+        )
+
         docs = []
-        if res and 'documents' in res:
-            for doc_list, meta_list in zip(res['documents'], res['metadatas']):
-                for d, m in zip(doc_list, meta_list):
-                    docs.append({"text": d, "metadata": m})
-        logger.debug(f"Retrieved {len(docs)} documents for query")
+
+        if res and "documents" in res:
+            for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+                docs.append({
+                    "text": doc,
+                    "metadata": meta
+                })
+        print("Retrieved docs:", len(docs))
+        
         return docs
 
-    def call_llm(self, prompt, max_tokens=512):
+    def call_llm(self, question, context, max_tokens=512):
+
         if not self.api_key:
             return "Gemini API key missing. Set GEMINI_API_KEY in .env."
 
         try:
+            max_tokens = int(max_tokens)
+
             model = genai.GenerativeModel(self.model_name)
+
+            prompt = PROMPT_TEMPLATE.format(
+                context=context,
+                question=question
+            )
+
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     max_output_tokens=max_tokens
                 )
             )
+
             return response.text
+
         except Exception as e:
             logger.error(f"Gemini API error: {str(e)}")
             return f"Error calling Gemini API: {str(e)}"
 
-    def answer(self, question, top_k=5):
+    def answer(self, question, google_id, top_k):
         if not question or len(question.strip()) == 0:
             return {"answer": "Question cannot be empty", "sources": [], "retrieved_count": 0}
         
-        docs = self.retrieve(question, k=top_k)
-        context = "\n\n".join([f"Source: {d['metadata'].get('source','unknown')}\n"+d['text'] for d in docs])
-        prompt = PROMPT_TEMPLATE.format(context=context, question=question)
-        llm_out = self.call_llm(prompt)
-        sources = list({d['metadata'].get('source','unknown') for d in docs})
-        
-        return {"answer": llm_out, "sources": sources, "retrieved_count": len(docs)}
+        docs = self.retrieve(question, google_id, k=top_k)
+
+        context = "\n\n".join([
+            f"[Source: {d['metadata'].get('source','unknown')}]\n{d['text']}"
+            for d in docs
+        ])
+
+        llm_out = self.call_llm(question, context)
+
+        sources = list({
+            d['metadata'].get('source', 'unknown')
+            for d in docs
+        })
+
+        return {
+            "answer": llm_out,
+            "sources": sources,
+            "retrieved_count": len(docs)
+        }

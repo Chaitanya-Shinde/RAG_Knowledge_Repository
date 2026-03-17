@@ -4,7 +4,7 @@ import os
 
 SECRET_KEY = os.getenv("JWT_SECRET", "supersecretdevkey")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
 
 def create_access_token(data: dict):

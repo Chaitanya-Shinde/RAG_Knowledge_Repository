@@ -36,11 +36,11 @@ export default function Sidebar() {
   }
 
   return (
-    <div className="w-64 bg-white border-r p-4 hidden md:block">
+    <div className="w-64 bg-white border-r p-4 hidden md:block ">
 
       <h2 className="font-semibold mb-4">Documents</h2>
 
-      <div className="space-y-2">
+      <div className="space-y-2 overflow-auto">
 
         {docs.map((d,i)=>(
           <div

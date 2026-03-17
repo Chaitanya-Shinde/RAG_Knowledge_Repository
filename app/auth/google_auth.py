@@ -90,7 +90,7 @@ def callback(request: Request):
 
     jwt_token = create_access_token({"google_id": google_id})
 
-    response = RedirectResponse(url="http://localhost:8000")  # your frontend
+    response = RedirectResponse(url="http://localhost:5173")  # your frontend
 
     
     response.set_cookie(

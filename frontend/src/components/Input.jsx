@@ -49,6 +49,7 @@ export default function Input({messages , setMessages}) {
       >
         <option value="gemini">Gemini</option>
         <option value="ollama">Ollama (Llama3.2)</option>
+        <option value="deepseek">Deepseek-r1 (1.5b)</option>
       </select>
 
       <button

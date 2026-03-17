@@ -205,7 +205,7 @@ async def query(
     if embed_model is None:
         return JSONResponse({"error": "Embedding model not initialized"}, status_code=500)
 
-    result = rag.answer(prompt,user["google_id"], k, model)
+    result = rag.answer(prompt, user["google_id"], k, model)
 
     return JSONResponse({
         "answer": result["answer"],

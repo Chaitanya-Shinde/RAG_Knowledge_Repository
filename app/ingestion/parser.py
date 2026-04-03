@@ -9,6 +9,10 @@ import pytesseract
 import io
 import logging
 
+pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
 LOG = logging.getLogger("rakr.parser")
 
 
@@ -45,7 +49,7 @@ def parse_file(file_stream, filename):
         elif ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"]:
             image = Image.open(file_stream)
             content = pytesseract.image_to_string(image)
-
+            print("Image content: ", content)
         else:
             content = file_stream.read().decode("utf-8", errors="ignore")
 

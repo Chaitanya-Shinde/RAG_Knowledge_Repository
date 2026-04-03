@@ -4,6 +4,8 @@ from collections import defaultdict, Counter
 from dotenv import load_dotenv
 import time
 import requests
+from io import StringIO
+import pandas as pd
 
 import google.generativeai as genai
 
@@ -24,11 +26,10 @@ Rules:
 - Use ONLY the information from the provided context.
 - Do NOT explain your thinking.
 - USE your reasoning.
-- Do NOT invent information.
 - Extract the correct information from the text.
 - Give direct answers to the users query.
 - Find the entire context for data
-- If the user demands an explaination, only then focus on explaining the concept asked by the user.
+- If the user demands an explanation, only then focus on explaining the concept asked by the user.
 - Combine relevant information across chunks to produce a full response.
 
 
@@ -113,23 +114,18 @@ class RAGSystem:
     # -------------------------
 
     def retrieve(self, query, google_id, k=6):
-        
         q_emb = self.embed_model.embed_query(query)
 
         collection = self.db.get_user_collection(google_id)
 
         # -------------------------
-        # Conversation Source Cache Retrieval
+        # Recent source cache retrieval
         # -------------------------
-
         recent_sources = self.get_recent_sources(google_id)
         print(f"\nrecent sources: {recent_sources}")
+
         if recent_sources:
-
-            print(f"Checking recent sources: {recent_sources}")
-
             try:
-
                 res = collection.query(
                     query_embeddings=[q_emb],
                     n_results=k,
@@ -140,42 +136,30 @@ class RAGSystem:
                 best_similarity = 0
 
                 if res and "documents" in res:
-
-                    SIMILARITY_THRESHOLD = 0.10
-
                     for doc, meta, dist in zip(
                         res["documents"][0],
                         res["metadatas"][0],
                         res["distances"][0]
                     ):
-
                         similarity = 1 - (dist / 2)
                         best_similarity = max(best_similarity, similarity)
-                        print(f"\nBest similarity: {best_similarity}")
-                        print(f"Recent source similarity: {similarity}")
 
-                        if similarity > SIMILARITY_THRESHOLD:
-
+                        if similarity >= 0.25:
                             docs.append({
                                 "text": doc,
                                 "metadata": meta,
                                 "score": similarity
                             })
 
-                CACHE_CONFIDENCE_THRESHOLD = 0.25
-
-                if docs and best_similarity > CACHE_CONFIDENCE_THRESHOLD:
-                    print(f"Using conversation cache retrieval")
+                if docs and best_similarity >= 0.30:
+                    print("Using strong recent source cache retrieval")
                     return docs
-
-                print(f"Conversation cache similarity too low, falling back to global search")
 
             except Exception as e:
                 logger.warning(f"Conversation cache retrieval failed: {e}")
 
         # Get all document sources
         res_all = collection.get()
-
         if not res_all or "metadatas" not in res_all:
             return []
 
@@ -185,64 +169,16 @@ class RAGSystem:
             if m.get("source")
         })
 
-        # # -------------------------
-        # # DOCUMENT ROUTING
-        # # -------------------------
-
-        # best_source = None
-        # best_similarity = 0
-
-        # for source in sources:
-
-        #     try:
-
-        #         res = collection.query(
-        #             query_embeddings=[q_emb],
-        #             n_results=1,
-        #             where={"source": source}
-        #         )
-
-        #         if res and res.get("distances"):
-
-        #             dist = res["distances"][0][0]
-        #             similarity = 1 - (dist / 2)
-
-        #             if similarity > best_similarity:
-        #                 best_similarity = similarity
-        #                 best_source = source
-
-        #     except Exception as e:
-        #         logger.warning(f"Routing failed for {source}: {e}")
-
-        # DOCUMENT_ROUTING_THRESHOLD = 0.30
-
-        # if best_similarity < DOCUMENT_ROUTING_THRESHOLD:
-        #     print(f"No document confidently matched. Best similarity {best_similarity}")
-        #     return []
-        # print(f"Selected document: {best_source}")
-        # res = collection.query(
-        #     query_embeddings=[q_emb],
-        #     n_results=k,
-        #     where={"source": best_source}
-        # )
         # -------------------------
-        # SIMPLE DOCUMENT NAME MATCH
+        # Filename match route
         # -------------------------
-
         query_words = set(query.lower().split())
-
         for source in sources:
-
-            name = source.lower().replace(".pdf","").replace(".csv","")
+            name = source.lower().replace("_", " ").replace(".", " ")
             name_words = set(name.split())
 
-            overlap = query_words & name_words
-
-            # if query shares words with filename
-            if overlap:
-
-                print(f"\nFilename match detected: {source}")
-
+            if query_words & name_words:
+                print(f"Filename match detected: {source}")
                 res = collection.query(
                     query_embeddings=[q_emb],
                     n_results=k,
@@ -250,60 +186,85 @@ class RAGSystem:
                 )
 
                 docs = []
-
                 if res and "documents" in res:
-
                     for doc, meta, dist in zip(
                         res["documents"][0],
                         res["metadatas"][0],
                         res["distances"][0]
                     ):
-
                         similarity = 1 - (dist / 2)
+                        if similarity >= 0.10:
+                            docs.append({
+                                "text": doc,
+                                "metadata": meta,
+                                "score": similarity
+                            })
 
-                        docs.append({
-                            "text": doc,
-                            "metadata": meta,
-                            "score": similarity
-                        })
-                print(f"docs: {docs[:200]}")
                 if docs:
                     return docs
 
         # -------------------------
-        # GLOBAL VECTOR SEARCH
+        # Global vector search + source-level reroute
         # -------------------------
-
         res = collection.query(
             query_embeddings=[q_emb],
-            n_results=k
+            n_results=100
+        )
+
+        if not res or "documents" not in res:
+            return []
+
+        hits = []
+        for doc, meta, dist in zip(
+            res["documents"][0],
+            res["metadatas"][0],
+            res["distances"][0]
+        ):
+            similarity = 1 - (dist / 2)
+            if similarity >= 0.15 and meta.get("source"):
+                hits.append({
+                    "text": doc,
+                    "metadata": meta,
+                    "score": similarity
+                })
+
+        if not hits:
+            return []
+
+        source_best_score = {}
+        for hit in hits:
+            src = hit["metadata"]["source"]
+            source_best_score[src] = max(source_best_score.get(src, 0), hit["score"])
+
+        best_source = max(source_best_score, key=lambda s: source_best_score[s])
+        best_source_score = source_best_score[best_source]
+
+        print(f"Selected best source: {best_source} with score {best_source_score}")
+
+        if best_source_score < 0.30:
+            # If no source has strong confidence, return top hits from all sources
+            return sorted(hits, key=lambda x: x["score"], reverse=True)[:k]
+
+        res_source = collection.query(
+            query_embeddings=[q_emb],
+            n_results=k,
+            where={"source": best_source}
         )
 
         docs = []
-        best_similarity = 0
-
-        if res and "documents" in res:
-
+        if res_source and "documents" in res_source:
             for doc, meta, dist in zip(
-                res["documents"][0],
-                res["metadatas"][0],
-                res["distances"][0]
+                res_source["documents"][0],
+                res_source["metadatas"][0],
+                res_source["distances"][0]
             ):
-
                 similarity = 1 - (dist / 2)
-                best_similarity = max(best_similarity, similarity)
-                if similarity > 0.25:
+                if similarity >= 0.15:
                     docs.append({
                         "text": doc,
                         "metadata": meta,
                         "score": similarity
                     })
-                print(f"Similarity: {similarity} | Source: {meta.get('source')}")
-
-            RETRIEVAL_CONFIDENCE_THRESHOLD = 0.10
-            if best_similarity < RETRIEVAL_CONFIDENCE_THRESHOLD:
-                print(f"Low similarity retrieval: {best_similarity}, returning results anyway")
-                
 
         return docs
     # -------------------------
@@ -375,6 +336,9 @@ class RAGSystem:
             context=context,
             question=question
         )
+
+        # Extra instruction to force numeric display, not recipe text
+        prompt += "\n\nIMPORTANT: When answered in dataset mode, return concrete numeric values only; do NOT return instructions, SQL templates, or step-by-step recipe text."
 
         retries = 3
 
@@ -464,7 +428,7 @@ class RAGSystem:
             "min", "minimum", "lowest",
             "average", "mean",
             "sum", "total",
-            "count"
+            "count", "stats", "statistic", "statistics", "salary", "datasheet", "dataset"
         ]
 
         q = query.lower()
@@ -490,15 +454,28 @@ class RAGSystem:
 
         if self.is_dataset_query(question):
 
-            result = self.handle_dataset_query(question, google_id)
+            print("Dataset query detected")
 
-            if result:
+            llm_result, llm_source = \
+                self.handle_dataset_query_via_llm(
+                    question,
+                    google_id,
+                    model
+                )
+
+            if llm_result:
 
                 return {
-                    "answer": result,
-                    "sources": [],
+                    "answer": llm_result,
+                    "sources": [{
+                        "filename": llm_source or "unknown",
+                        "snippet": ""
+                    }],
                     "retrieved_count": 0
                 }
+
+            # fallback to normal RAG if dataset failed
+            print("Dataset handler failed — falling back to retrieval")
 
         # -------------------------
         # RETRIEVE
@@ -632,7 +609,290 @@ class RAGSystem:
 
 
         return "Unknown model selected"
+
     
+    def find_best_csv_data(self, question, google_id):
+
+        from io import StringIO
+        import pandas as pd
+        import re
+
+        collection = self.db.get_user_collection(google_id)
+
+        res_all = collection.get()
+
+        if not res_all or "metadatas" not in res_all:
+            return None, None
+
+        # Find CSV sources
+        csv_sources = [
+            m["source"]
+            for m in res_all["metadatas"]
+            if m.get("source", "").lower().endswith(".csv")
+        ]
+
+        if not csv_sources:
+            return None, None
+
+        q_lower = question.lower()
+
+        best_source = None
+
+        # Try filename match
+        for src in csv_sources:
+
+            if any(word in src.lower() for word in q_lower.split()):
+                best_source = src
+                break
+
+        if not best_source:
+            best_source = csv_sources[0]
+
+        try:
+
+            # Load stored documents
+            source_data = collection.get(
+                where={"source": best_source}
+            )
+
+            if not source_data or "documents" not in source_data:
+                return None, best_source
+
+            raw_text = "\n".join(
+                source_data["documents"]
+            )
+
+            print("\nRaw text preview:\n", raw_text[:500])
+
+            # -------------------------
+            # Try normal CSV first
+            # -------------------------
+
+            try:
+
+                df = pd.read_csv(
+                    StringIO(raw_text),
+                    low_memory=False
+                )
+
+                if len(df.columns) == 1:
+
+                    raise ValueError(
+                        "Single-column detected"
+                    )
+
+            except Exception:
+
+                print("Trying table reconstruction...")
+
+                # -------------------------
+                # Rebuild table from spaces
+                # -------------------------
+
+                lines = raw_text.split("\n")
+
+                cleaned_lines = []
+
+                for line in lines:
+
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    # Replace multiple spaces with comma
+                    line = re.sub(
+                        r"\s{2,}",
+                        ",",
+                        line
+                    )
+
+                    cleaned_lines.append(line)
+
+                rebuilt_text = "\n".join(cleaned_lines)
+
+                df = pd.read_csv(
+                    StringIO(rebuilt_text)
+                )
+
+            # -------------------------
+            # Convert numeric columns
+            # -------------------------
+
+            for col in df.columns:
+
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="ignore"
+                )
+
+            print("\nDetected columns:", df.columns.tolist())
+            print("\nFirst rows:\n", df.head())
+
+            return df, best_source
+
+        except Exception as e:
+
+            logger.warning(
+                f"CSV reconstruction failed: {e}"
+            )
+
+            return None, best_source
+
+    def profile_dataframe(self, df):
+
+        import numpy as np
+
+        profile = {}
+
+        profile["row_count"] = len(df)
+        profile["column_count"] = len(df.columns)
+
+        numeric_cols = df.select_dtypes(
+            include=[np.number]
+        ).columns.tolist()
+
+        profile["numeric_columns"] = numeric_cols
+
+        profile["columns"] = []
+
+        for col in df.columns:
+
+            col_data = df[col]
+
+            col_info = {
+                "name": col,
+                "dtype": str(col_data.dtype),
+                "missing": int(col_data.isna().sum()),
+                "unique": int(col_data.nunique())
+            }
+
+            if col in numeric_cols:
+
+                stats = col_data.describe()
+
+                col_info["stats"] = {
+                    "count": float(stats.get("count", 0)),
+                    "min": float(stats.get("min", 0)),
+                    "max": float(stats.get("max", 0)),
+                    "mean": float(stats.get("mean", 0)),
+                    "median": float(stats.get("50%", 0)),
+                    "std": float(stats.get("std", 0))
+                }
+
+            profile["columns"].append(col_info)
+
+        return profile
+
+    def build_dataset_math_context(self, df, source):
+
+        profile = self.profile_dataframe(df)
+
+        sample_rows = df.head(8).to_csv(
+            index=False
+        )
+
+        numeric_cols = profile["numeric_columns"]
+
+        correlation_text = ""
+
+        if len(numeric_cols) > 1:
+
+            corr = df[numeric_cols].corr().round(3)
+
+            correlation_text = "\nCORRELATIONS:\n"
+            correlation_text += corr.to_string()
+            correlation_text += "\n"
+
+        context = f"""
+    DATASET SOURCE: {source}
+
+    DATASET OVERVIEW:
+    Rows: {profile['row_count']}
+    Columns: {profile['column_count']}
+
+    NUMERIC COLUMNS:
+    {numeric_cols}
+
+    COLUMN DETAILS:
+    """
+
+        for col in profile["columns"]:
+
+            context += f"""
+    Column: {col['name']}
+    Type: {col['dtype']}
+    Missing: {col['missing']}
+    Unique: {col['unique']}
+    """
+
+            if "stats" in col:
+
+                s = col["stats"]
+
+                context += f"""
+    Statistics:
+    Count: {s['count']}
+    Min: {s['min']}
+    Max: {s['max']}
+    Mean: {s['mean']}
+    Median: {s['median']}
+    Std: {s['std']}
+    """
+
+        context += correlation_text
+
+        context += f"""
+
+    SAMPLE DATA:
+    {sample_rows}
+
+    INSTRUCTIONS:
+    Answer using dataset facts.
+    Return numeric answers when possible.
+    """
+
+        return context
+
+    def handle_dataset_query_via_llm(
+        self,
+        question,
+        google_id,
+        model="gemini"
+    ):
+
+        df, source = self.find_best_csv_data(
+            question,
+            google_id
+        )
+
+        if df is None or df.empty:
+
+            return None, source
+
+        try:
+
+            context = self.build_dataset_math_context(
+                df,
+                source
+            )
+
+            answer = self.generate(
+                question,
+                context,
+                model
+            )
+
+            return answer, source
+
+        except Exception as e:
+
+            logger.error(
+                f"Dataset math failed: {e}"
+            )
+
+            return None, source
+
     # -------------------------
     # INTENT DETECTION
     # -------------------------
@@ -660,69 +920,158 @@ class RAGSystem:
     # DATASET ANALYSIS
     # -------------------------
 
-    def handle_dataset_query(self, question, google_id):
+    # def handle_dataset_query(self, question, google_id):
 
-        import pandas as pd
-        from io import StringIO
+    #     import numpy as np
+    #     import pandas as pd
+    #     import re
+    #     from io import StringIO
 
-        collection = self.db.get_user_collection(google_id)
+    #     collection = self.db.get_user_collection(google_id)
 
-        res = collection.get()
+    #     # first, pick the most likely CSV source from retrieval or filename hints
+    #     csv_sources = []
+    #     res_all = collection.get()
+    #     if res_all and "metadatas" in res_all:
+    #         csv_sources = [
+    #             m["source"] for m in res_all["metadatas"]
+    #             if m.get("source", "").lower().endswith(".csv")
+    #         ]
 
-        if not res or "documents" not in res:
-            return None
+    #     q_lower = question.lower()
 
-        # detect csv sources
-        csv_sources = set(
-            m["source"]
-            for m in res["metadatas"]
-            if m["source"].endswith(".csv")
-        )
+    #     best_source = None
+    #     if "salary" in q_lower and csv_sources:
+    #         salary_csvs = [src for src in csv_sources if "salary" in src.lower()]
+    #         best_source = salary_csvs[0] if salary_csvs else csv_sources[0]
 
-        if not csv_sources:
-            return None
+    #     if not best_source:
+    #         # choose best candidate by semantic retrieval score (including non-CSV fallback)
+    #         retrieved_docs = self.retrieve(question, google_id, k=20)
+    #         source_scores = {}
+    #         for d in retrieved_docs:
+    #             src = d["metadata"].get("source")
+    #             score = d.get("score", 0)
+    #             if src:
+    #                 source_scores[src] = max(source_scores.get(src, 0), score)
+    #         if source_scores:
+    #             best_source = max(source_scores, key=source_scores.get)
 
-        # for now use the first dataset
-        source = list(csv_sources)[0]
+    #     if not best_source and csv_sources:
+    #         best_source = csv_sources[0]
 
-        res = collection.get(where={"source": source})
+    #     # Build strong CSV stats if possible
+    #     if best_source and best_source.lower().endswith(".csv"):
+    #         try:
+    #             source_data = collection.get(where={"source": best_source})
+    #             if source_data and "documents" in source_data:
+    #                 raw_text = "\n".join(source_data["documents"])
+    #                 df = pd.read_csv(StringIO(raw_text))
 
-        text = "\n".join(res["documents"])
+    #                 if not df.empty:
+    #                     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    #                     if not numeric_cols:
+    #                         for col in df.columns:
+    #                             coerced = pd.to_numeric(df[col], errors="coerce")
+    #                             if coerced.notna().sum() > 0:
+    #                                 df[col] = coerced
+    #                         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
-        try:
+    #                     if numeric_cols:
+    #                         selected_col = None
+    #                         if "salary" in q_lower:
+    #                             salary_cols = [c for c in numeric_cols if "salary" in str(c).lower()]
+    #                             if salary_cols:
+    #                                 selected_col = salary_cols[0]
 
-            df = pd.read_csv(StringIO(text))
+    #                         for col in numeric_cols:
+    #                             if col.lower() in q_lower and selected_col is None:
+    #                                 selected_col = col
 
-            q = question.lower()
+    #                         if not selected_col:
+    #                             selected_col = numeric_cols[0]
 
-            if "max" in q or "highest" in q:
+    #                         series = df[selected_col].dropna().astype(float)
+    #                         stats_summary = series.describe().to_dict()
 
-                col = df.select_dtypes(include="number").columns[-1]
+    #                         answers = []
+    #                         if "max" in q_lower or "highest" in q_lower:
+    #                             answers.append(f"Highest {selected_col} = {stats_summary['max']}")
+    #                         if "min" in q_lower or "lowest" in q_lower:
+    #                             answers.append(f"Lowest {selected_col} = {stats_summary['min']}")
+    #                         if "average" in q_lower or "mean" in q_lower:
+    #                             answers.append(f"Average {selected_col} = {round(stats_summary['mean'], 2)}")
+    #                         if "sum" in q_lower or "total" in q_lower:
+    #                             answers.append(f"Total {selected_col} = {round(series.sum(), 2)}")
+    #                         if "count" in q_lower or "rows" in q_lower:
+    #                             answers.append(f"Row count = {int(stats_summary['count'])}")
 
-                max_val = df[col].max()
+    #                         if "statistic" in q_lower or "statistics" in q_lower or "describe" in q_lower or "summary" in q_lower:
+    #                             answers.append(
+    #                                 f"{selected_col} statistics (count={int(stats_summary['count'])}, mean={round(stats_summary['mean'],2)}, "
+    #                                 f"std={round(stats_summary['std'],2)}, min={stats_summary['min']}, 25%={stats_summary['25%']}, "
+    #                                 f"50%={stats_summary['50%']}, 75%={stats_summary['75%']}, max={stats_summary['max']})"
+    #                             )
 
-                row = df[df[col] == max_val].iloc[0]
+    #                         if not answers:
+    #                             answers.append(
+    #                                 f"Dataset {best_source} column {selected_col} stats: count={int(stats_summary['count'])}, "
+    #                                 f"mean={round(stats_summary['mean'],2)}, min={stats_summary['min']}, max={stats_summary['max']}"
+    #                             )
 
-                return f"The highest {col} is {max_val}."
+    #                         sample_data = series.head(5).tolist()
+    #                         answers.append(f"Sample values: {sample_data}")
+    #                         result = "; ".join(answers) + f" (source: {best_source})"
+    #                         return result
 
-            if "min" in q or "lowest" in q:
+    #         except Exception as e:
+    #             logger.warning(f"Dataset CSV analysis failed: {e}")
 
-                col = df.select_dtypes(include="number").columns[-1]
+    #     # Non-CSV fallback: extract relevant numeric values from retrieved docs
+    #     retrieved_docs = self.retrieve(question, google_id, k=20)
+    #     if not retrieved_docs:
+    #         return None
 
-                min_val = df[col].min()
+    #     text = "\n".join(d.get("text", "") for d in retrieved_docs)
+    #     if not text.strip():
+    #         return None
 
-                return f"The lowest {col} is {min_val}."
+    #     numbers = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?", text)
+    #     values = []
+    #     for n in numbers:
+    #         norm = n.replace(",", "")
+    #         try:
+    #             values.append(float(norm))
+    #         except ValueError:
+    #             continue
 
-            if "average" in q or "mean" in q:
+    #     if not values:
+    #         return None
 
-                col = df.select_dtypes(include="number").columns[-1]
+    #     arr = np.array(values, dtype=float)
+    #     max_v = float(arr.max())
+    #     min_v = float(arr.min())
+    #     mean_v = float(arr.mean())
+    #     total_v = float(arr.sum())
+    #     count_v = int(arr.size)
 
-                avg = df[col].mean()
+    #     answers = []
+    #     if "max" in q_lower or "highest" in q_lower:
+    #         answers.append(f"Highest value found = {max_v}")
+    #     if "min" in q_lower or "lowest" in q_lower:
+    #         answers.append(f"Lowest value found = {min_v}")
+    #     if "average" in q_lower or "mean" in q_lower:
+    #         answers.append(f"Average value found = {round(mean_v,2)}")
+    #     if "sum" in q_lower or "total" in q_lower:
+    #         answers.append(f"Total value found = {round(total_v,2)}")
+    #     if "count" in q_lower or "rows" in q_lower:
+    #         answers.append(f"Numeric count = {count_v}")
 
-                return f"The average {col} is {round(avg,2)}."
+    #     if "statistic" in q_lower or "statistics" in q_lower or "describe" in q_lower or "summary" in q_lower:
+    #         answers.append(f"Fallback stats from text extraction: count={count_v}, mean={round(mean_v,2)}, min={min_v}, max={max_v}, std={round(float(np.std(arr)),2)}")
 
-        except Exception as e:
+    #     if not answers:
+    #         answers.append(f"Text-value stats: count={count_v}, mean={round(mean_v,2)}, min={min_v}, max={max_v}")
 
-            logger.warning(f"Dataset analysis failed: {e}")
-
-        return None
+    #     result = "; ".join(answers) + f" (source: {best_source or 'retrieved documents'})"
+    #     return result

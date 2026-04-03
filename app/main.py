@@ -195,6 +195,7 @@ async def ingest(user=Depends(get_current_user)):
         print("INGEST ERROR:", e)
         raise
 
+
 @app.post('/query')
 async def query(
     prompt: str = Form(...),
@@ -207,9 +208,11 @@ async def query(
 
     result = rag.answer(prompt, user["google_id"], k, model)
 
+    # Return answer + sources + eval metadata for benchmarking
     return JSONResponse({
         "answer": result["answer"],
-        "sources": result["sources"]
+        "sources": result["sources"],
+        "eval": result.get("eval", {})   # <-- add this line
     })
 
 @app.get("/documents")

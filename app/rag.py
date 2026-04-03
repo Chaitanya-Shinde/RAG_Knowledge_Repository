@@ -1,13 +1,15 @@
 import os
-import logging
-from collections import defaultdict, Counter
-from dotenv import load_dotenv
+import re
 import time
-import requests
+import logging
+import json
+from collections import Counter
 from io import StringIO
-import pandas as pd
 
+import pandas as pd
 import google.generativeai as genai
+import requests
+from dotenv import load_dotenv
 
 from .embeddings import EmbeddingModel
 from .db_client import ChromaClient
@@ -15,114 +17,281 @@ from .db_client import ChromaClient
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATE = """
-You are a helpful AI assistant.
 
-If the context is empty or irrelevant, answer normally like a chatbot.
+# =============================================================================
+# MODEL-SPECIFIC PROMPTS
+#
+# WHY SEPARATE PROMPTS?
+# Gemini 2.5 Flash is a large frontier model — it handles nuanced, multi-rule
+# instructions well and benefits from detailed guidance.
+#
+# Llama 3.2 1B and DeepSeek-R1 1.5B are tiny local models. Long, complex
+# prompts confuse them and cause hallucination or instruction-following failure.
+# They need a single, ultra-direct directive: "use only the context, answer
+# the question, nothing else." This is not cheating the comparison — it's
+# giving each model the prompt it can actually follow, which is the fair way
+# to benchmark RAG faithfulness and accuracy.
+#
+# All three models receive IDENTICAL context chunks (same retrieval pipeline).
+# The only difference is prompt style, not information.
+# =============================================================================
 
+# --- Gemini: detailed, nuanced ---
+GEMINI_PROMPT = """You are a precise AI assistant embedded in a knowledge retrieval system.
 
-Rules:
-- You may have access to document context. If the context is useful, use it to answer the question.
-- Use ONLY the information from the provided context.
-- Do NOT explain your thinking.
-- USE your reasoning.
-- Extract the correct information from the text.
-- Give direct answers to the users query.
-- Find the entire context for data
-- If the user demands an explanation, only then focus on explaining the concept asked by the user.
-- Combine relevant information across chunks to produce a full response.
-
-
-Context:
+CONTEXT (retrieved from user's documents):
 {context}
 
-User Question:
+USER QUESTION:
 {question}
-"""
+
+INSTRUCTIONS:
+- If the context is relevant, answer ONLY using information from it.
+- If the context is empty or irrelevant, answer from general knowledge and say so briefly.
+- Do not explain your reasoning unless the user explicitly asks.
+- Combine information across chunks if needed for a complete answer.
+- For numeric/dataset questions, return concrete values, not templates or SQL.
+- Be direct and concise."""
+
+# --- Llama 3.2 1B: ultra-short, single directive ---
+# Small models hallucinate when given long instruction lists.
+# One clear rule outperforms five nuanced ones at 1B scale.
+LLAMA_PROMPT = """Use ONLY the context below to answer the question. Do not add anything not in the context. If the context does not contain the answer, say "I don't know based on the provided documents."
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+ANSWER:"""
+
+# --- DeepSeek-R1 1.5B: same philosophy as llama, slight structural difference
+# to match DeepSeek's instruction-following training format ---
+DEEPSEEK_PROMPT = """<context>
+{context}
+</context>
+
+Answer the following question using ONLY the information in the context above.
+If the answer is not in the context, say "Not found in documents."
+Do not reason out loud. Give a direct answer only.
+
+Question: {question}
+Answer:"""
+
+# --- Intent classification prompts (model-specific) ---
+# The classifier must return a single word. Small models fail at JSON or
+# multi-line outputs, so we keep the format as simple as possible.
+
+GEMINI_INTENT_PROMPT = """You are a query router. Classify the user query into exactly one category.
+
+Available document sources the user has uploaded:
+{sources}
+
+User query: "{question}"
+
+Rules:
+- DATASET_QUERY: the query asks for numeric aggregation (max, min, average, sum, count, statistics) AND there is a relevant CSV/spreadsheet source that would contain that data.
+- SMALLTALK: the query is a greeting, thanks, or casual chat with no information need.
+- DOCUMENT_QUERY: everything else — questions about document content, explanations, summaries, descriptions, technical details.
+
+Respond with exactly one word: DATASET_QUERY, SMALLTALK, or DOCUMENT_QUERY"""
+
+LLAMA_INTENT_PROMPT = """Classify this query into one word: DATASET_QUERY, SMALLTALK, or DOCUMENT_QUERY.
+
+Documents available: {sources}
+Query: "{question}"
+
+DATASET_QUERY = asks for numbers/stats from a CSV file.
+SMALLTALK = greeting or casual chat.
+DOCUMENT_QUERY = anything else.
+
+One word answer:"""
+
+DEEPSEEK_INTENT_PROMPT = """<task>Classify the query. Reply with ONE word only.</task>
+
+Documents: {sources}
+Query: "{question}"
+
+DATASET_QUERY = numeric stats from CSV
+SMALLTALK = greeting/casual
+DOCUMENT_QUERY = everything else
+
+Answer:"""
+
+
+def _get_prompt(template: str, context: str, question: str) -> str:
+    return template.format(context=context, question=question)
+
+
+def _get_intent_prompt(model: str, sources: str, question: str) -> str:
+    if model == "gemini":
+        return GEMINI_INTENT_PROMPT.format(sources=sources, question=question)
+    elif model == "deepseek":
+        return DEEPSEEK_INTENT_PROMPT.format(sources=sources, question=question)
+    else:
+        return LLAMA_INTENT_PROMPT.format(sources=sources, question=question)
+
+
+INTENT_VALUES = {"DATASET_QUERY", "SMALLTALK", "DOCUMENT_QUERY"}
 
 
 class RAGSystem:
-    def __init__(self, embed_model: EmbeddingModel,  db_client: ChromaClient,model="llama3.2:1b"):
+    def __init__(self, embed_model: EmbeddingModel, db_client: ChromaClient, model="llama3.2:1b"):
         self.embed_model = embed_model
         self.db = db_client
         self.db.ensure_collection()
         self.local_llm = model
 
-        # -------------------------
-        # Conversation memory
-        # -------------------------
-
-        # Stores recently used document sources per user
-        # Example:
-        # {
-        #   "user123": ["esa_doc.pdf", "ml_notes.pdf"]
-        # }
-        self.recent_sources = {}
-
-        # limit memory size
+        self.recent_sources: dict = {}
         self.max_recent_sources = 15
-        
+
         self.api_key = os.getenv("GEMINI_API_KEY")
-
-        if self.api_key: 
+        if self.api_key:
             genai.configure(api_key=self.api_key)
-
         self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-    # -------------------------
-    # Conversation Source Cache
-    # -------------------------
+    # =========================================================================
+    # CONVERSATION SOURCE CACHE
+    # =========================================================================
 
-    def get_recent_sources(self, google_id):
-
+    def get_recent_sources(self, google_id: str) -> list:
         return self.recent_sources.get(google_id, [])
 
-
-    def update_recent_sources(self, google_id, source):
-
-        if google_id not in self.recent_sources:
-            self.recent_sources[google_id] = []
-
-        sources = self.recent_sources[google_id]
-
-        # avoid duplicates
+    def update_recent_sources(self, google_id: str, source: str):
+        sources = self.recent_sources.setdefault(google_id, [])
         if source not in sources:
             sources.append(source)
-
-        # keep only last N
         self.recent_sources[google_id] = sources[-self.max_recent_sources:]
-        
-    # -------------------------
-    # DOCUMENT INDEXING
-    # -------------------------
 
-    def index_documents(self, docs):
+    # =========================================================================
+    # DOCUMENT INDEXING
+    # =========================================================================
+
+    def index_documents(self, docs: list) -> dict:
         ids = [d["id"] for d in docs]
         texts = [d["text"] for d in docs]
         metas = [d.get("metadata", {}) for d in docs]
-
         embeddings = self.embed_model.embed_documents(texts)
-
         self.db.add_documents(ids, texts, metas, embeddings.tolist())
-
         print(f"Indexed {len(docs)} documents")
-
         return {"indexed": len(docs)}
 
-    # -------------------------
+    # =========================================================================
+    # INTENT CLASSIFICATION  (LLM-based, model-aware)
+    # =========================================================================
+
+    def classify_intent(self, question: str, google_id: str, model: str) -> str:
+        """
+        Ask the selected LLM to classify the query intent.
+        Returns one of: DATASET_QUERY | DOCUMENT_QUERY | SMALLTALK
+
+        The model sees what document sources exist so it can make an informed
+        decision — e.g. it won't classify as DATASET_QUERY if only PDFs exist.
+
+        Falls back to DOCUMENT_QUERY on any failure.
+        """
+        try:
+            collection = self.db.get_user_collection(google_id)
+            res_all = collection.get()
+
+            if res_all and "metadatas" in res_all:
+                sources = list({
+                    m.get("source", "")
+                    for m in res_all["metadatas"]
+                    if m.get("source")
+                })
+            else:
+                sources = []
+
+            source_summary = ", ".join(sources) if sources else "none"
+            intent_prompt = _get_intent_prompt(model, source_summary, question)
+
+            # Retry once on empty response
+            for attempt in range(2):
+                raw = self._call_llm_raw(intent_prompt, model, max_tokens=10)
+                
+                if raw and raw.strip():  # Non-empty response
+                    for intent in INTENT_VALUES:
+                        if intent in raw.upper():
+                            print(f"[Intent] '{intent}' classified by {model} | raw='{raw.strip()}'")
+                            return intent
+                    print(f"[Intent] Unrecognised response '{raw.strip()}' -> DOCUMENT_QUERY")
+                    return "DOCUMENT_QUERY"
+                
+                # Empty response, retry once
+                if attempt == 0:
+                    logger.warning(f"[Intent] Empty response on attempt 1, retrying...")
+                    time.sleep(0.5)
+                    continue
+
+            # Both attempts failed or returned empty
+            print(f"[Intent] No valid response after retries -> DOCUMENT_QUERY")
+            return "DOCUMENT_QUERY"
+
+        except Exception as e:
+            logger.warning(f"Intent classification failed: {e} -> DOCUMENT_QUERY")
+            return "DOCUMENT_QUERY"
+
+    # =========================================================================
+    # RAW LLM CALL  (intent classifier — no template wrapping)
+    # =========================================================================
+
+    def _call_llm_raw(self, prompt: str, model: str, max_tokens: int = 10) -> str:
+        if model == "gemini":
+            return self._gemini_raw(prompt, max_tokens)
+        elif model == "deepseek":
+            return self._ollama_raw(prompt, "deepseek-r1:1.5b", max_tokens)
+        else:
+            return self._ollama_raw(prompt, "llama3.2:1b", max_tokens)
+
+    def _gemini_raw(self, prompt: str, max_tokens: int = 10) -> str:
+        if not self.api_key:
+            return "DOCUMENT_QUERY"
+        try:
+            mdl = genai.GenerativeModel(self.model_name)
+            resp = mdl.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens)
+            )
+            # Handle empty response (finish_reason 2 = STOP with no content)
+            if resp.text:
+                return resp.text.strip()
+            return "DOCUMENT_QUERY"
+        except Exception as e:
+            logger.warning(f"Gemini raw call failed: {e}")
+            return "DOCUMENT_QUERY"
+
+    def _ollama_raw(self, prompt: str, ollama_model: str, max_tokens: int = 10) -> str:
+        try:
+            resp = requests.post(
+                "http://localhost:11434/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"num_predict": max_tokens, "temperature": 0.0}
+                },
+                timeout=120
+            )
+            data = resp.json()
+            content = data.get("message", {}).get("content", "").strip()
+            return content if content else "DOCUMENT_QUERY"
+        except Exception as e:
+            logger.warning(f"Ollama raw call failed: {e}")
+            return "DOCUMENT_QUERY"
+
+    # =========================================================================
     # RETRIEVAL
-    # -------------------------
+    # =========================================================================
 
-    def retrieve(self, query, google_id, k=6):
+    def retrieve(self, query: str, google_id: str, k: int = 6) -> list:
         q_emb = self.embed_model.embed_query(query)
-
         collection = self.db.get_user_collection(google_id)
 
-        # -------------------------
-        # Recent source cache retrieval
-        # -------------------------
+        # --- Recent source cache ---
         recent_sources = self.get_recent_sources(google_id)
-        print(f"\nrecent sources: {recent_sources}")
+        print(f"\n[Retrieval] Recent sources in cache: {recent_sources}")
 
         if recent_sources:
             try:
@@ -131,34 +300,14 @@ class RAGSystem:
                     n_results=k,
                     where={"source": {"$in": recent_sources}}
                 )
-
-                docs = []
-                best_similarity = 0
-
-                if res and "documents" in res:
-                    for doc, meta, dist in zip(
-                        res["documents"][0],
-                        res["metadatas"][0],
-                        res["distances"][0]
-                    ):
-                        similarity = 1 - (dist / 2)
-                        best_similarity = max(best_similarity, similarity)
-
-                        if similarity >= 0.25:
-                            docs.append({
-                                "text": doc,
-                                "metadata": meta,
-                                "score": similarity
-                            })
-
-                if docs and best_similarity >= 0.30:
-                    print("Using strong recent source cache retrieval")
+                docs, best_sim = self._parse_query_results(res, threshold=0.25)
+                if docs and best_sim >= 0.30:
+                    print("[Retrieval] Cache hit — using recent source")
                     return docs
-
             except Exception as e:
-                logger.warning(f"Conversation cache retrieval failed: {e}")
+                logger.warning(f"Cache retrieval failed: {e}")
 
-        # Get all document sources
+        # --- All sources ---
         res_all = collection.get()
         if not res_all or "metadatas" not in res_all:
             return []
@@ -169,909 +318,396 @@ class RAGSystem:
             if m.get("source")
         })
 
-        # -------------------------
-        # Filename match route
-        # -------------------------
-        query_words = set(query.lower().split())
+        # --- Filename token match (meaningful words only, length > 2) ---
+        query_words = set(re.sub(r"[^\w\s]", "", query.lower()).split())
         for source in sources:
-            name = source.lower().replace("_", " ").replace(".", " ")
-            name_words = set(name.split())
-
-            if query_words & name_words:
-                print(f"Filename match detected: {source}")
+            name_words = set(re.sub(r"[._\-]", " ", source.lower()).split())
+            meaningful_overlap = {w for w in (query_words & name_words) if len(w) > 2}
+            if meaningful_overlap:
+                print(f"[Retrieval] Filename match: '{source}' overlap={meaningful_overlap}")
                 res = collection.query(
                     query_embeddings=[q_emb],
                     n_results=k,
                     where={"source": source}
                 )
-
-                docs = []
-                if res and "documents" in res:
-                    for doc, meta, dist in zip(
-                        res["documents"][0],
-                        res["metadatas"][0],
-                        res["distances"][0]
-                    ):
-                        similarity = 1 - (dist / 2)
-                        if similarity >= 0.10:
-                            docs.append({
-                                "text": doc,
-                                "metadata": meta,
-                                "score": similarity
-                            })
-
+                docs, _ = self._parse_query_results(res, threshold=0.10)
                 if docs:
                     return docs
 
-        # -------------------------
-        # Global vector search + source-level reroute
-        # -------------------------
-        res = collection.query(
-            query_embeddings=[q_emb],
-            n_results=100
-        )
-
+        # --- Global vector search -> best source reroute ---
+        res = collection.query(query_embeddings=[q_emb], n_results=100)
         if not res or "documents" not in res:
             return []
 
-        hits = []
-        for doc, meta, dist in zip(
-            res["documents"][0],
-            res["metadatas"][0],
-            res["distances"][0]
-        ):
-            similarity = 1 - (dist / 2)
-            if similarity >= 0.15 and meta.get("source"):
-                hits.append({
-                    "text": doc,
-                    "metadata": meta,
-                    "score": similarity
-                })
-
-        if not hits:
+        all_hits, _ = self._parse_query_results(res, threshold=0.15)
+        if not all_hits:
             return []
 
-        source_best_score = {}
-        for hit in hits:
-            src = hit["metadata"]["source"]
-            source_best_score[src] = max(source_best_score.get(src, 0), hit["score"])
+        source_best: dict = {}
+        for hit in all_hits:
+            src = hit["metadata"].get("source", "")
+            source_best[src] = max(source_best.get(src, 0), hit["score"])
 
-        best_source = max(source_best_score, key=lambda s: source_best_score[s])
-        best_source_score = source_best_score[best_source]
+        best_source = max(source_best, key=source_best.get)
+        best_score = source_best[best_source]
+        print(f"[Retrieval] Global best: '{best_source}' score={best_score:.3f}")
 
-        print(f"Selected best source: {best_source} with score {best_source_score}")
-
-        if best_source_score < 0.30:
-            # If no source has strong confidence, return top hits from all sources
-            return sorted(hits, key=lambda x: x["score"], reverse=True)[:k]
+        if best_score < 0.30:
+            return sorted(all_hits, key=lambda x: x["score"], reverse=True)[:k]
 
         res_source = collection.query(
             query_embeddings=[q_emb],
             n_results=k,
             where={"source": best_source}
         )
-
-        docs = []
-        if res_source and "documents" in res_source:
-            for doc, meta, dist in zip(
-                res_source["documents"][0],
-                res_source["metadatas"][0],
-                res_source["distances"][0]
-            ):
-                similarity = 1 - (dist / 2)
-                if similarity >= 0.15:
-                    docs.append({
-                        "text": doc,
-                        "metadata": meta,
-                        "score": similarity
-                    })
-
+        docs, _ = self._parse_query_results(res_source, threshold=0.15)
         return docs
-    # -------------------------
-    # CONTEXT EXPANSION
-    # -------------------------
 
-    def expand_context(self, docs, google_id, max_chunks_per_doc=3):
+    def _parse_query_results(self, res: dict, threshold: float) -> tuple:
+        docs = []
+        best_sim = 0.0
+        if not res or "documents" not in res:
+            return docs, best_sim
+        for doc, meta, dist in zip(
+            res["documents"][0],
+            res["metadatas"][0],
+            res["distances"][0]
+        ):
+            sim = 1 - (dist / 2)
+            best_sim = max(best_sim, sim)
+            if sim >= threshold:
+                docs.append({"text": doc, "metadata": meta, "score": sim})
+        return docs, best_sim
 
-        collection = self.db.get_user_collection(google_id)
+    # =========================================================================
+    # LLM CALLS
+    # =========================================================================
 
-        sources = set(
-            d["metadata"].get("source")
-            for d in docs
-        )
-
-        expanded_docs = []
-
-        for source in sources:
-
-            try:
-
-                res = collection.get(where={"source": source})
-
-                if not res or "documents" not in res:
-                    continue
-
-                docs_for_source = list(
-                    zip(res["documents"], res["metadatas"])
-                )
-
-                docs_for_source = sorted(
-                    docs_for_source,
-                    key=lambda x: x[1].get("chunk_index", 0)
-                )
-
-                docs_for_source = docs_for_source[:max_chunks_per_doc]
-
-                for text, meta in docs_for_source:
-
-                    text_lower = text.lower()
-
-                    # remove low quality chunks
-                    if "table of contents" in text_lower or "index" in text_lower:
-                        continue
-
-                    expanded_docs.append({
-                        "text": text,
-                        "metadata": meta
-                    })
-
-            except Exception as e:
-
-                logger.warning(f"Context expansion failed for {source}: {e}")
-
-        return expanded_docs
-
-    # -------------------------
-    # LLM CALL
-    # -------------------------
-
-    def call_gemini(self, question, context, max_tokens=1000):
-
+    def call_gemini(self, question: str, context: str, max_tokens: int = 1000) -> str:
         if not self.api_key:
             return "Gemini API key missing."
-
-        model = genai.GenerativeModel(self.model_name)
-
-        prompt = PROMPT_TEMPLATE.format(
-            context=context,
-            question=question
-        )
-
-        # Extra instruction to force numeric display, not recipe text
-        prompt += "\n\nIMPORTANT: When answered in dataset mode, return concrete numeric values only; do NOT return instructions, SQL templates, or step-by-step recipe text."
-
-        retries = 3
-
-        for attempt in range(retries):
-
+        prompt = _get_prompt(GEMINI_PROMPT, context, question)
+        mdl = genai.GenerativeModel(self.model_name)
+        for attempt in range(3):
             try:
-
-                response = model.generate_content(
+                response = mdl.generate_content(
                     prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=max_tokens
-                    )
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens)
                 )
-
                 return response.text
-
             except Exception as e:
-
                 if "429" in str(e):
-
-                    wait_time = 10
-                    logger.warning(f"Rate limit hit. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
+                    logger.warning(f"Gemini rate limit — waiting 10s (attempt {attempt+1})")
+                    time.sleep(10)
                     continue
+                logger.error(f"Gemini API error: {e}")
+                return f"Error calling Gemini API: {e}"
+        return "Gemini rate limit exceeded. Please try again later."
 
-                logger.error(f"Gemini API error: {str(e)}")
-                return f"Error calling Gemini API: {str(e)}"
-
-        return "LLM rate limit exceeded. Please try again later."
-
-    def call_ollama(self, prompt, context, model="ollama", max_tokens=500):
+    def call_ollama(self, question: str, context: str, model: str = "ollama") -> str:
+        if model == "deepseek":
+            ollama_model = "deepseek-r1:1.5b"
+            prompt = _get_prompt(DEEPSEEK_PROMPT, context, question)
+        else:
+            ollama_model = "llama3.2:1b-instruct-q4_K_M"
+            prompt = _get_prompt(LLAMA_PROMPT, context, question)
 
         try:
-
-            if model == "deepseek":
-                ollama_model = "deepseek-r1:1.5b"
-            else:
-                ollama_model = "llama3.2:1b"
-
             response = requests.post(
                 "http://localhost:11434/api/chat",
                 json={
                     "model": ollama_model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
+                    "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                     "options": {
-                        "num_ctx": 1500,
+                        "num_ctx": 2000,
                         "num_predict": 1000,
-                        "temperature": 0.2
+                        "temperature": 0.1
                     }
                 },
                 timeout=600
             )
-            
-
             data = response.json()
-
             message = data.get("message", {})
-
             content = message.get("content", "").strip()
             thinking = message.get("thinking", "").strip()
+            return content if content else thinking
+        except Exception as e:
+            logger.error(f"Ollama error: {e}")
+            return f"Ollama error: {e}"
 
-            if not content and thinking:
-                return thinking
+    def generate(self, question: str, context: str, model: str = "gemini") -> str:
+        """Route to the right LLM with its model-specific prompt."""
+        if model == "gemini":
+            return self.call_gemini(question, context)
+        elif model == "deepseek":
+            return self.call_ollama(question, context, model="deepseek")
+        elif model in ("ollama", "llama"):
+            return self.call_ollama(question, context, model="ollama")
+        return "Unknown model selected."
 
-            return content
+    # =========================================================================
+    # CSV / DATASET HANDLING
+    # =========================================================================
+
+    def find_and_load_best_csv(self, question: str, google_id: str) -> tuple:
+        """
+        Find the most semantically relevant CSV for the query, not just any CSV.
+        Returns (DataFrame, source_name) or (None, None).
+        """
+        collection = self.db.get_user_collection(google_id)
+        res_all = collection.get()
+
+        if not res_all or "metadatas" not in res_all:
+            return None, None
+
+        csv_sources = list({
+            m["source"]
+            for m in res_all["metadatas"]
+            if m.get("source", "").lower().endswith(".csv")
+        })
+
+        if not csv_sources:
+            return None, None
+
+        q_emb = self.embed_model.embed_query(question)
+        source_scores: dict = {}
+
+        for src in csv_sources:
+            try:
+                res = collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=5,
+                    where={"source": src}
+                )
+                if res and "distances" in res and res["distances"][0]:
+                    best_sim = max(1 - (d / 2) for d in res["distances"][0])
+                    source_scores[src] = best_sim
+                    print(f"[CSV] {src} -> score={best_sim:.3f}")
+            except Exception as e:
+                logger.warning(f"CSV scoring failed for {src}: {e}")
+
+        if not source_scores:
+            return None, None
+
+        best_source = max(source_scores, key=source_scores.get)
+        best_score = source_scores[best_source]
+
+        if best_score < 0.25:
+            print(f"[CSV] Best CSV '{best_source}' score={best_score:.3f} below threshold — skipping")
+            return None, None
+
+        print(f"[CSV] Selected: '{best_source}' (score={best_score:.3f})")
+
+        try:
+            source_data = collection.get(where={"source": best_source})
+            if not source_data or "documents" not in source_data:
+                return None, best_source
+
+            raw_text = "\n".join(source_data["documents"])
+
+            try:
+                df = pd.read_csv(StringIO(raw_text), low_memory=False)
+                if len(df.columns) == 1:
+                    raise ValueError("Single-column fallback")
+            except Exception:
+                lines = [
+                    re.sub(r"\s{2,}", ",", l.strip())
+                    for l in raw_text.split("\n") if l.strip()
+                ]
+                df = pd.read_csv(StringIO("\n".join(lines)))
+
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="ignore")
+
+            return df, best_source
 
         except Exception as e:
+            logger.warning(f"CSV load failed for {best_source}: {e}")
+            return None, best_source
 
-            logger.error(f"Ollama error: {str(e)}")
+    def build_dataset_context(self, df: pd.DataFrame, source: str) -> str:
+        """Build a compact, LLM-readable statistical summary."""
+        import numpy as np
 
-            return f"Ollama error: {str(e)}"
-    
-    # -------------------------
-    # DATASET QUERY DETECTION
-    # -------------------------
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        rows, cols = df.shape
+        parts = [f"DATASET: {source}", f"Shape: {rows} rows x {cols} columns", ""]
 
-    def is_dataset_query(self, query):
-
-        keywords = [
-            "max", "maximum", "highest",
-            "min", "minimum", "lowest",
-            "average", "mean",
-            "sum", "total",
-            "count", "stats", "statistic", "statistics", "salary", "datasheet", "dataset"
-        ]
-
-        q = query.lower()
-
-        return any(k in q for k in keywords)
-
-    # -------------------------
-    # MAIN RAG PIPELINE
-    # -------------------------
-
-    def answer(self, question, google_id, top_k, model="gemini"):
-
-        if not question or len(question.strip()) == 0:
-            return {
-                "answer": "Question cannot be empty",
-                "sources": [],
-                "retrieved_count": 0
-            }
-
-        # -------------------------
-        # DATASET QUERY HANDLER
-        # -------------------------
-
-        if self.is_dataset_query(question):
-
-            print("Dataset query detected")
-
-            llm_result, llm_source = \
-                self.handle_dataset_query_via_llm(
-                    question,
-                    google_id,
-                    model
+        for col in df.columns:
+            if col in numeric_cols:
+                s = df[col].describe()
+                parts.append(
+                    f"Column '{col}' (numeric) | count={int(s['count'])} "
+                    f"min={s['min']:.2f} max={s['max']:.2f} "
+                    f"mean={s['mean']:.2f} median={s['50%']:.2f} std={s['std']:.2f}"
+                )
+            else:
+                parts.append(
+                    f"Column '{col}' (text) | unique={df[col].nunique()} "
+                    f"sample={df[col].dropna().head(3).tolist()}"
                 )
 
-            if llm_result:
+        parts.append("\nSAMPLE ROWS (first 5):")
+        parts.append(df.head(5).to_csv(index=False))
 
-                return {
-                    "answer": llm_result,
-                    "sources": [{
-                        "filename": llm_source or "unknown",
-                        "snippet": ""
-                    }],
-                    "retrieved_count": 0
-                }
+        if len(numeric_cols) > 1:
+            parts.append("CORRELATIONS:")
+            parts.append(df[numeric_cols].corr().round(3).to_string())
 
-            # fallback to normal RAG if dataset failed
-            print("Dataset handler failed — falling back to retrieval")
+        return "\n".join(parts)
 
-        # -------------------------
-        # RETRIEVE
-        # -------------------------
+    # =========================================================================
+    # MAIN RAG PIPELINE
+    # =========================================================================
 
-        # -------------------------
-        # INTENT GATE
-        # -------------------------
-
-        if self.is_smalltalk(question):
-
-            print("Smalltalk detected → skipping retrieval")
-
+    def answer(self, question: str, google_id: str, top_k: int, model: str = "gemini") -> dict:
+        if not question or not question.strip():
             return {
-                "answer": self.generate(question, "", model),
+                "answer": "Question cannot be empty.",
                 "sources": [],
-                "retrieved_count": 0
+                "retrieved_count": 0,
+                "eval": {}
             }
 
-        # Step 2: retrieval
-        retrieved_docs = self.retrieve(
-            question,
-            google_id,
-            k=top_k
-        )
+        pipeline_start = time.time()
 
-        # USE_CONTEXT_THRESHOLD = 0.10
+        # ------------------------------------------------------------------
+        # STEP 1: LLM-based intent classification
+        # ------------------------------------------------------------------
+        intent_start = time.time()
+        intent = self.classify_intent(question, google_id, model)
+        intent_latency = time.time() - intent_start
+        print(f"[Pipeline] Intent={intent} ({intent_latency:.2f}s via {model})")
 
-        # docs = [
-        #     d for d in retrieved_docs
-        #     if d["score"] >= USE_CONTEXT_THRESHOLD
-        # ]
+        # ------------------------------------------------------------------
+        # STEP 2: Route by intent
+        # ------------------------------------------------------------------
 
-        print("\nretrieved_docs ",retrieved_docs)
+        if intent == "SMALLTALK":
+            gen_start = time.time()
+            answer_text = self.generate(question, "", model)
+            gen_latency = time.time() - gen_start
+            return self._build_response(
+                answer=answer_text, sources=[], retrieved_count=0,
+                context_chars=0, intent=intent, model=model,
+                intent_latency=intent_latency, gen_latency=gen_latency,
+                total_latency=time.time() - pipeline_start
+            )
+
+        if intent == "DATASET_QUERY":
+            df, csv_source = self.find_and_load_best_csv(question, google_id)
+            if df is not None and not df.empty:
+                context = self.build_dataset_context(df, csv_source)
+                gen_start = time.time()
+                answer_text = self.generate(question, context, model)
+                gen_latency = time.time() - gen_start
+                return self._build_response(
+                    answer=answer_text,
+                    sources=[{"filename": csv_source, "snippet": ""}],
+                    retrieved_count=0, context_chars=len(context),
+                    intent=intent, model=model,
+                    intent_latency=intent_latency, gen_latency=gen_latency,
+                    total_latency=time.time() - pipeline_start
+                )
+            # No relevant CSV — fall through to document retrieval
+            print("[Pipeline] DATASET_QUERY but no relevant CSV — falling back to document retrieval")
+            intent = "DOCUMENT_QUERY"
+
+        # ------------------------------------------------------------------
+        # STEP 3: Document retrieval
+        # ------------------------------------------------------------------
+        ret_start = time.time()
+        retrieved_docs = self.retrieve(question, google_id, k=top_k)
+        ret_latency = time.time() - ret_start
+        print(f"[Pipeline] Retrieved {len(retrieved_docs)} chunks ({ret_latency:.2f}s)")
 
         if not retrieved_docs:
+            gen_start = time.time()
+            answer_text = self.generate(question, "", model)
+            gen_latency = time.time() - gen_start
+            return self._build_response(
+                answer=answer_text, sources=[], retrieved_count=0,
+                context_chars=0, intent=intent, model=model,
+                intent_latency=intent_latency, gen_latency=gen_latency,
+                total_latency=time.time() - pipeline_start,
+                retrieval_latency=ret_latency
+            )
 
-            # fallback to normal chatbot
-            llm_out = self.generate(question, "", model)
-
-            return {
-                "answer": llm_out,
-                "sources": [],
-                "retrieved_count": 0
-            }
-
-        # -------------------------
-        # SELECT SINGLE DOCUMENT
-        # -------------------------
-
+        # ------------------------------------------------------------------
+        # STEP 4: Select best source, build shared context
+        # ------------------------------------------------------------------
         source_counts = Counter(
-            d["metadata"].get("source", "unknown")
-            for d in retrieved_docs
+            d["metadata"].get("source", "unknown") for d in retrieved_docs
         )
-
         best_source = source_counts.most_common(1)[0][0]
-        # update conversation memory
         self.update_recent_sources(google_id, best_source)
 
-        docs = [
-            d for d in retrieved_docs
-            if d["metadata"].get("source") == best_source
-        ]
-
-        # -------------------------
-        # SORT CHUNKS
-        # -------------------------
-        
-
         docs = sorted(
-            docs,
+            [d for d in retrieved_docs if d["metadata"].get("source") == best_source],
             key=lambda x: x["metadata"].get("chunk_index", 0)
         )
 
+        # All models get the SAME context — fair comparison
+        context = f"Source document: {best_source}\n\n" + "\n\n".join(d["text"] for d in docs)
+        print(f"[Pipeline] Context: {len(docs)} chunks, {len(context)} chars from '{best_source}'")
 
-        # -------------------------
-        # BUILD CONTEXT (ONLY ONE DOC)
-        # -------------------------
-
-        if docs:
-            context = "\n\n".join(d["text"] for d in docs)
-        else:
-            context = ""
-        # context = "\n\n".join(d["text"] for d in docs)
-
-        context = f"Document: {best_source}\n\n{context}"
-
-        # -------------------------
-        # GENERATE ANSWER
-        # -------------------------
-        print("\nChunks sent:", len(docs))
-        print("\nContext chars:", len(context))
-
-        
-        llm_out = self.generate(question, context, model)
-
-        # -------------------------
-        # SOURCES
-        # -------------------------
+        # ------------------------------------------------------------------
+        # STEP 5: Generate
+        # ------------------------------------------------------------------
+        gen_start = time.time()
+        answer_text = self.generate(question, context, model)
+        gen_latency = time.time() - gen_start
 
         sources = [{
             "filename": best_source,
             "snippet": docs[0]["text"][:200] if docs else ""
         }]
 
-        return {
-            "answer": llm_out,
-            "sources": sources,
-            "retrieved_count": len(docs)
-        }
-    
-
-    def generate(self, question, context, model="gemini"):
-
-        if context:
-            prompt = PROMPT_TEMPLATE.format(
-                context=context,
-                question=question
-            )
-        else:
-            prompt = question
-    
-        if model == "ollama":
-            return self.call_ollama(prompt, context, model='ollama')
-
-        if model == "gemini":
-            return self.call_gemini(prompt, context)
-        
-        if model == "deepseek":
-            return self.call_ollama(prompt, context, model='deepseek')
-
-
-        return "Unknown model selected"
-
-    
-    def find_best_csv_data(self, question, google_id):
-
-        from io import StringIO
-        import pandas as pd
-        import re
-
-        collection = self.db.get_user_collection(google_id)
-
-        res_all = collection.get()
-
-        if not res_all or "metadatas" not in res_all:
-            return None, None
-
-        # Find CSV sources
-        csv_sources = [
-            m["source"]
-            for m in res_all["metadatas"]
-            if m.get("source", "").lower().endswith(".csv")
-        ]
-
-        if not csv_sources:
-            return None, None
-
-        q_lower = question.lower()
-
-        best_source = None
-
-        # Try filename match
-        for src in csv_sources:
-
-            if any(word in src.lower() for word in q_lower.split()):
-                best_source = src
-                break
-
-        if not best_source:
-            best_source = csv_sources[0]
-
-        try:
-
-            # Load stored documents
-            source_data = collection.get(
-                where={"source": best_source}
-            )
-
-            if not source_data or "documents" not in source_data:
-                return None, best_source
-
-            raw_text = "\n".join(
-                source_data["documents"]
-            )
-
-            print("\nRaw text preview:\n", raw_text[:500])
-
-            # -------------------------
-            # Try normal CSV first
-            # -------------------------
-
-            try:
-
-                df = pd.read_csv(
-                    StringIO(raw_text),
-                    low_memory=False
-                )
-
-                if len(df.columns) == 1:
-
-                    raise ValueError(
-                        "Single-column detected"
-                    )
-
-            except Exception:
-
-                print("Trying table reconstruction...")
-
-                # -------------------------
-                # Rebuild table from spaces
-                # -------------------------
-
-                lines = raw_text.split("\n")
-
-                cleaned_lines = []
-
-                for line in lines:
-
-                    line = line.strip()
-
-                    if not line:
-                        continue
-
-                    # Replace multiple spaces with comma
-                    line = re.sub(
-                        r"\s{2,}",
-                        ",",
-                        line
-                    )
-
-                    cleaned_lines.append(line)
-
-                rebuilt_text = "\n".join(cleaned_lines)
-
-                df = pd.read_csv(
-                    StringIO(rebuilt_text)
-                )
-
-            # -------------------------
-            # Convert numeric columns
-            # -------------------------
-
-            for col in df.columns:
-
-                df[col] = pd.to_numeric(
-                    df[col],
-                    errors="ignore"
-                )
-
-            print("\nDetected columns:", df.columns.tolist())
-            print("\nFirst rows:\n", df.head())
-
-            return df, best_source
-
-        except Exception as e:
-
-            logger.warning(
-                f"CSV reconstruction failed: {e}"
-            )
-
-            return None, best_source
-
-    def profile_dataframe(self, df):
-
-        import numpy as np
-
-        profile = {}
-
-        profile["row_count"] = len(df)
-        profile["column_count"] = len(df.columns)
-
-        numeric_cols = df.select_dtypes(
-            include=[np.number]
-        ).columns.tolist()
-
-        profile["numeric_columns"] = numeric_cols
-
-        profile["columns"] = []
-
-        for col in df.columns:
-
-            col_data = df[col]
-
-            col_info = {
-                "name": col,
-                "dtype": str(col_data.dtype),
-                "missing": int(col_data.isna().sum()),
-                "unique": int(col_data.nunique())
-            }
-
-            if col in numeric_cols:
-
-                stats = col_data.describe()
-
-                col_info["stats"] = {
-                    "count": float(stats.get("count", 0)),
-                    "min": float(stats.get("min", 0)),
-                    "max": float(stats.get("max", 0)),
-                    "mean": float(stats.get("mean", 0)),
-                    "median": float(stats.get("50%", 0)),
-                    "std": float(stats.get("std", 0))
-                }
-
-            profile["columns"].append(col_info)
-
-        return profile
-
-    def build_dataset_math_context(self, df, source):
-
-        profile = self.profile_dataframe(df)
-
-        sample_rows = df.head(8).to_csv(
-            index=False
+        return self._build_response(
+            answer=answer_text, sources=sources,
+            retrieved_count=len(docs), context_chars=len(context),
+            intent=intent, model=model,
+            intent_latency=intent_latency, gen_latency=gen_latency,
+            total_latency=time.time() - pipeline_start,
+            retrieval_latency=ret_latency
         )
 
-        numeric_cols = profile["numeric_columns"]
+    # =========================================================================
+    # RESPONSE BUILDER — eval metadata attached to every response
+    # =========================================================================
 
-        correlation_text = ""
-
-        if len(numeric_cols) > 1:
-
-            corr = df[numeric_cols].corr().round(3)
-
-            correlation_text = "\nCORRELATIONS:\n"
-            correlation_text += corr.to_string()
-            correlation_text += "\n"
-
-        context = f"""
-    DATASET SOURCE: {source}
-
-    DATASET OVERVIEW:
-    Rows: {profile['row_count']}
-    Columns: {profile['column_count']}
-
-    NUMERIC COLUMNS:
-    {numeric_cols}
-
-    COLUMN DETAILS:
-    """
-
-        for col in profile["columns"]:
-
-            context += f"""
-    Column: {col['name']}
-    Type: {col['dtype']}
-    Missing: {col['missing']}
-    Unique: {col['unique']}
-    """
-
-            if "stats" in col:
-
-                s = col["stats"]
-
-                context += f"""
-    Statistics:
-    Count: {s['count']}
-    Min: {s['min']}
-    Max: {s['max']}
-    Mean: {s['mean']}
-    Median: {s['median']}
-    Std: {s['std']}
-    """
-
-        context += correlation_text
-
-        context += f"""
-
-    SAMPLE DATA:
-    {sample_rows}
-
-    INSTRUCTIONS:
-    Answer using dataset facts.
-    Return numeric answers when possible.
-    """
-
-        return context
-
-    def handle_dataset_query_via_llm(
+    def _build_response(
         self,
-        question,
-        google_id,
-        model="gemini"
-    ):
-
-        df, source = self.find_best_csv_data(
-            question,
-            google_id
-        )
-
-        if df is None or df.empty:
-
-            return None, source
-
-        try:
-
-            context = self.build_dataset_math_context(
-                df,
-                source
-            )
-
-            answer = self.generate(
-                question,
-                context,
-                model
-            )
-
-            return answer, source
-
-        except Exception as e:
-
-            logger.error(
-                f"Dataset math failed: {e}"
-            )
-
-            return None, source
-
-    # -------------------------
-    # INTENT DETECTION
-    # -------------------------
-
-    def is_smalltalk(self, query):
-
-        smalltalk = [
-            "hi",
-            "hello",
-            "hey",
-            "thanks",
-            "thank you",
-            "good morning",
-            "good evening",
-            "how are you",
-            "what's up",
-            "whats up"
-        ]
-
-        q = query.lower().strip()
-
-        return q in smalltalk
-    
-    # -------------------------
-    # DATASET ANALYSIS
-    # -------------------------
-
-    # def handle_dataset_query(self, question, google_id):
-
-    #     import numpy as np
-    #     import pandas as pd
-    #     import re
-    #     from io import StringIO
-
-    #     collection = self.db.get_user_collection(google_id)
-
-    #     # first, pick the most likely CSV source from retrieval or filename hints
-    #     csv_sources = []
-    #     res_all = collection.get()
-    #     if res_all and "metadatas" in res_all:
-    #         csv_sources = [
-    #             m["source"] for m in res_all["metadatas"]
-    #             if m.get("source", "").lower().endswith(".csv")
-    #         ]
-
-    #     q_lower = question.lower()
-
-    #     best_source = None
-    #     if "salary" in q_lower and csv_sources:
-    #         salary_csvs = [src for src in csv_sources if "salary" in src.lower()]
-    #         best_source = salary_csvs[0] if salary_csvs else csv_sources[0]
-
-    #     if not best_source:
-    #         # choose best candidate by semantic retrieval score (including non-CSV fallback)
-    #         retrieved_docs = self.retrieve(question, google_id, k=20)
-    #         source_scores = {}
-    #         for d in retrieved_docs:
-    #             src = d["metadata"].get("source")
-    #             score = d.get("score", 0)
-    #             if src:
-    #                 source_scores[src] = max(source_scores.get(src, 0), score)
-    #         if source_scores:
-    #             best_source = max(source_scores, key=source_scores.get)
-
-    #     if not best_source and csv_sources:
-    #         best_source = csv_sources[0]
-
-    #     # Build strong CSV stats if possible
-    #     if best_source and best_source.lower().endswith(".csv"):
-    #         try:
-    #             source_data = collection.get(where={"source": best_source})
-    #             if source_data and "documents" in source_data:
-    #                 raw_text = "\n".join(source_data["documents"])
-    #                 df = pd.read_csv(StringIO(raw_text))
-
-    #                 if not df.empty:
-    #                     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    #                     if not numeric_cols:
-    #                         for col in df.columns:
-    #                             coerced = pd.to_numeric(df[col], errors="coerce")
-    #                             if coerced.notna().sum() > 0:
-    #                                 df[col] = coerced
-    #                         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-    #                     if numeric_cols:
-    #                         selected_col = None
-    #                         if "salary" in q_lower:
-    #                             salary_cols = [c for c in numeric_cols if "salary" in str(c).lower()]
-    #                             if salary_cols:
-    #                                 selected_col = salary_cols[0]
-
-    #                         for col in numeric_cols:
-    #                             if col.lower() in q_lower and selected_col is None:
-    #                                 selected_col = col
-
-    #                         if not selected_col:
-    #                             selected_col = numeric_cols[0]
-
-    #                         series = df[selected_col].dropna().astype(float)
-    #                         stats_summary = series.describe().to_dict()
-
-    #                         answers = []
-    #                         if "max" in q_lower or "highest" in q_lower:
-    #                             answers.append(f"Highest {selected_col} = {stats_summary['max']}")
-    #                         if "min" in q_lower or "lowest" in q_lower:
-    #                             answers.append(f"Lowest {selected_col} = {stats_summary['min']}")
-    #                         if "average" in q_lower or "mean" in q_lower:
-    #                             answers.append(f"Average {selected_col} = {round(stats_summary['mean'], 2)}")
-    #                         if "sum" in q_lower or "total" in q_lower:
-    #                             answers.append(f"Total {selected_col} = {round(series.sum(), 2)}")
-    #                         if "count" in q_lower or "rows" in q_lower:
-    #                             answers.append(f"Row count = {int(stats_summary['count'])}")
-
-    #                         if "statistic" in q_lower or "statistics" in q_lower or "describe" in q_lower or "summary" in q_lower:
-    #                             answers.append(
-    #                                 f"{selected_col} statistics (count={int(stats_summary['count'])}, mean={round(stats_summary['mean'],2)}, "
-    #                                 f"std={round(stats_summary['std'],2)}, min={stats_summary['min']}, 25%={stats_summary['25%']}, "
-    #                                 f"50%={stats_summary['50%']}, 75%={stats_summary['75%']}, max={stats_summary['max']})"
-    #                             )
-
-    #                         if not answers:
-    #                             answers.append(
-    #                                 f"Dataset {best_source} column {selected_col} stats: count={int(stats_summary['count'])}, "
-    #                                 f"mean={round(stats_summary['mean'],2)}, min={stats_summary['min']}, max={stats_summary['max']}"
-    #                             )
-
-    #                         sample_data = series.head(5).tolist()
-    #                         answers.append(f"Sample values: {sample_data}")
-    #                         result = "; ".join(answers) + f" (source: {best_source})"
-    #                         return result
-
-    #         except Exception as e:
-    #             logger.warning(f"Dataset CSV analysis failed: {e}")
-
-    #     # Non-CSV fallback: extract relevant numeric values from retrieved docs
-    #     retrieved_docs = self.retrieve(question, google_id, k=20)
-    #     if not retrieved_docs:
-    #         return None
-
-    #     text = "\n".join(d.get("text", "") for d in retrieved_docs)
-    #     if not text.strip():
-    #         return None
-
-    #     numbers = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?", text)
-    #     values = []
-    #     for n in numbers:
-    #         norm = n.replace(",", "")
-    #         try:
-    #             values.append(float(norm))
-    #         except ValueError:
-    #             continue
-
-    #     if not values:
-    #         return None
-
-    #     arr = np.array(values, dtype=float)
-    #     max_v = float(arr.max())
-    #     min_v = float(arr.min())
-    #     mean_v = float(arr.mean())
-    #     total_v = float(arr.sum())
-    #     count_v = int(arr.size)
-
-    #     answers = []
-    #     if "max" in q_lower or "highest" in q_lower:
-    #         answers.append(f"Highest value found = {max_v}")
-    #     if "min" in q_lower or "lowest" in q_lower:
-    #         answers.append(f"Lowest value found = {min_v}")
-    #     if "average" in q_lower or "mean" in q_lower:
-    #         answers.append(f"Average value found = {round(mean_v,2)}")
-    #     if "sum" in q_lower or "total" in q_lower:
-    #         answers.append(f"Total value found = {round(total_v,2)}")
-    #     if "count" in q_lower or "rows" in q_lower:
-    #         answers.append(f"Numeric count = {count_v}")
-
-    #     if "statistic" in q_lower or "statistics" in q_lower or "describe" in q_lower or "summary" in q_lower:
-    #         answers.append(f"Fallback stats from text extraction: count={count_v}, mean={round(mean_v,2)}, min={min_v}, max={max_v}, std={round(float(np.std(arr)),2)}")
-
-    #     if not answers:
-    #         answers.append(f"Text-value stats: count={count_v}, mean={round(mean_v,2)}, min={min_v}, max={max_v}")
-
-    #     result = "; ".join(answers) + f" (source: {best_source or 'retrieved documents'})"
-    #     return result
+        answer: str,
+        sources: list,
+        retrieved_count: int,
+        context_chars: int,
+        intent: str,
+        model: str,
+        intent_latency: float,
+        gen_latency: float,
+        total_latency: float,
+        retrieval_latency: float = 0.0,
+    ) -> dict:
+        """
+        Attaches an 'eval' block to every response so your frontend/logger
+        can record and compare models across latency, context size, and intent.
+        """
+        return {
+            "answer": answer,
+            "sources": sources,
+            "retrieved_count": retrieved_count,
+            "eval": {
+                "model": model,
+                "intent": intent,
+                "context_chars": context_chars,
+                "retrieved_count": retrieved_count,
+                "latency": {
+                    "intent_classification_s": round(intent_latency, 3),
+                    "retrieval_s": round(retrieval_latency, 3),
+                    "generation_s": round(gen_latency, 3),
+                    "total_s": round(total_latency, 3),
+                },
+            }
+        }

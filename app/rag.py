@@ -36,27 +36,32 @@ logger = logging.getLogger(__name__)
 # The only difference is prompt style, not information.
 # =============================================================================
 
-# --- Gemini: detailed, nuanced ---
+# --- Gemini: detailed, nuanced, conversation-aware ---
 GEMINI_PROMPT = """You are a precise AI assistant embedded in a knowledge retrieval system.
 
-CONTEXT (retrieved from user's documents):
+CONVERSATION HISTORY (most recent exchanges, for context continuity):
+{history}
+
+RETRIEVED DOCUMENT CONTEXT (from user's uploaded files):
 {context}
 
 USER QUESTION:
 {question}
 
 INSTRUCTIONS:
-- If the context is relevant, answer ONLY using information from it.
-- If the context is empty or irrelevant, answer from general knowledge and say so briefly.
+- Use the conversation history to understand follow-up questions and references like "it", "that", "the previous one".
+- If the retrieved context is relevant, prefer it as your primary source of truth.
+- If the context is empty or irrelevant, answer from conversation history or general knowledge and say so briefly.
 - Do not explain your reasoning unless the user explicitly asks.
-- Combine information across chunks if needed for a complete answer.
+- Combine information across multiple document chunks and sources if needed.
 - For numeric/dataset questions, return concrete values, not templates or SQL.
 - Be direct and concise."""
 
 # --- Llama 3.2 1B: ultra-short, single directive ---
-# Small models hallucinate when given long instruction lists.
-# One clear rule outperforms five nuanced ones at 1B scale.
-LLAMA_PROMPT = """Use ONLY the context below to answer the question. Do not add anything not in the context. If the context does not contain the answer, say "I don't know based on the provided documents."
+LLAMA_PROMPT = """Previous conversation:
+{history}
+
+Use ONLY the context below (and conversation above) to answer the question. If the context does not contain the answer, say "I don't know based on the provided documents."
 
 CONTEXT:
 {context}
@@ -66,27 +71,32 @@ QUESTION:
 
 ANSWER:"""
 
-# --- DeepSeek-R1 1.5B: same philosophy as llama, slight structural difference
-# to match DeepSeek's instruction-following training format ---
-DEEPSEEK_PROMPT = """<context>
+# --- DeepSeek-R1 1.5B ---
+DEEPSEEK_PROMPT = """<history>
+{history}
+</history>
+
+<context>
 {context}
 </context>
 
-Answer the following question using ONLY the information in the context above.
+Answer the following question using the context and conversation history above.
 If the answer is not in the context, say "Not found in documents."
 Do not reason out loud. Give a direct answer only.
+Use your Reasoning to generate answers.
+Do not show thinking.
 
 Question: {question}
 Answer:"""
 
 # --- Intent classification prompts (model-specific) ---
-# The classifier must return a single word. Small models fail at JSON or
-# multi-line outputs, so we keep the format as simple as possible.
-
 GEMINI_INTENT_PROMPT = """You are a query router. Classify the user query into exactly one category.
 
 Available document sources the user has uploaded:
 {sources}
+
+Conversation history (last few turns):
+{history}
 
 User query: "{question}"
 
@@ -100,6 +110,7 @@ Respond with exactly one word: DATASET_QUERY, SMALLTALK, or DOCUMENT_QUERY"""
 LLAMA_INTENT_PROMPT = """Classify this query into one word: DATASET_QUERY, SMALLTALK, or DOCUMENT_QUERY.
 
 Documents available: {sources}
+Recent conversation: {history}
 Query: "{question}"
 
 DATASET_QUERY = asks for numbers/stats from a CSV file.
@@ -111,6 +122,7 @@ One word answer:"""
 DEEPSEEK_INTENT_PROMPT = """<task>Classify the query. Reply with ONE word only.</task>
 
 Documents: {sources}
+History: {history}
 Query: "{question}"
 
 DATASET_QUERY = numeric stats from CSV
@@ -120,17 +132,38 @@ DOCUMENT_QUERY = everything else
 Answer:"""
 
 
-def _get_prompt(template: str, context: str, question: str) -> str:
-    return template.format(context=context, question=question)
+def _format_history(history: list[dict]) -> str:
+    """
+    Convert a list of {"role": "user"|"assistant", "text": "..."} dicts
+    into a compact human-readable string for prompt injection.
+    Keeps only the last 6 turns (3 exchanges) to avoid context overflow.
+    """
+    if not history:
+        return "(no previous conversation)"
+    recent = history[-6:]
+    lines = []
+    for msg in recent:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {msg['text'][:400]}")  # truncate very long turns
+    return "\n".join(lines)
 
 
-def _get_intent_prompt(model: str, sources: str, question: str) -> str:
+def _get_prompt(template: str, context: str, question: str, history: list[dict]) -> str:
+    return template.format(
+        context=context,
+        question=question,
+        history=_format_history(history),
+    )
+
+
+def _get_intent_prompt(model: str, sources: str, question: str, history: list[dict]) -> str:
+    h = _format_history(history)
     if model == "gemini":
-        return GEMINI_INTENT_PROMPT.format(sources=sources, question=question)
+        return GEMINI_INTENT_PROMPT.format(sources=sources, question=question, history=h)
     elif model == "deepseek":
-        return DEEPSEEK_INTENT_PROMPT.format(sources=sources, question=question)
+        return DEEPSEEK_INTENT_PROMPT.format(sources=sources, question=question, history=h)
     else:
-        return LLAMA_INTENT_PROMPT.format(sources=sources, question=question)
+        return LLAMA_INTENT_PROMPT.format(sources=sources, question=question, history=h)
 
 
 INTENT_VALUES = {"DATASET_QUERY", "SMALLTALK", "DOCUMENT_QUERY"}
@@ -143,6 +176,7 @@ class RAGSystem:
         self.db.ensure_collection()
         self.local_llm = model
 
+        # Per-user in-memory source cache (for retrieval rerouting within a session)
         self.recent_sources: dict = {}
         self.max_recent_sources = 15
 
@@ -178,17 +212,15 @@ class RAGSystem:
         return {"indexed": len(docs)}
 
     # =========================================================================
-    # INTENT CLASSIFICATION  (LLM-based, model-aware)
+    # INTENT CLASSIFICATION  (LLM-based, model-aware, history-aware)
     # =========================================================================
 
-    def classify_intent(self, question: str, google_id: str, model: str) -> str:
+    def classify_intent(self, question: str, google_id: str, model: str, history: list[dict]) -> str:
         """
         Ask the selected LLM to classify the query intent.
+        Now receives conversation history so it can resolve references like
+        "what about that CSV?" correctly.
         Returns one of: DATASET_QUERY | DOCUMENT_QUERY | SMALLTALK
-
-        The model sees what document sources exist so it can make an informed
-        decision — e.g. it won't classify as DATASET_QUERY if only PDFs exist.
-
         Falls back to DOCUMENT_QUERY on any failure.
         """
         try:
@@ -205,28 +237,22 @@ class RAGSystem:
                 sources = []
 
             source_summary = ", ".join(sources) if sources else "none"
-            intent_prompt = _get_intent_prompt(model, source_summary, question)
+            intent_prompt = _get_intent_prompt(model, source_summary, question, history)
 
-            # Retry once on empty response
             for attempt in range(2):
                 raw = self._call_llm_raw(intent_prompt, model, max_tokens=10)
-                
-                if raw and raw.strip():  # Non-empty response
+                if raw and raw.strip():
                     for intent in INTENT_VALUES:
                         if intent in raw.upper():
                             print(f"[Intent] '{intent}' classified by {model} | raw='{raw.strip()}'")
                             return intent
                     print(f"[Intent] Unrecognised response '{raw.strip()}' -> DOCUMENT_QUERY")
                     return "DOCUMENT_QUERY"
-                
-                # Empty response, retry once
                 if attempt == 0:
-                    logger.warning(f"[Intent] Empty response on attempt 1, retrying...")
+                    logger.warning("[Intent] Empty response on attempt 1, retrying...")
                     time.sleep(0.5)
-                    continue
 
-            # Both attempts failed or returned empty
-            print(f"[Intent] No valid response after retries -> DOCUMENT_QUERY")
+            print("[Intent] No valid response after retries -> DOCUMENT_QUERY")
             return "DOCUMENT_QUERY"
 
         except Exception as e:
@@ -243,7 +269,7 @@ class RAGSystem:
         elif model == "deepseek":
             return self._ollama_raw(prompt, "deepseek-r1:1.5b", max_tokens)
         else:
-            return self._ollama_raw(prompt, "llama3.2:1b", max_tokens)
+            return self._ollama_raw(prompt, "llama3.2:1b-instruct-q4_K_M", max_tokens)
 
     def _gemini_raw(self, prompt: str, max_tokens: int = 10) -> str:
         if not self.api_key:
@@ -254,10 +280,7 @@ class RAGSystem:
                 prompt,
                 generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens)
             )
-            # Handle empty response (finish_reason 2 = STOP with no content)
-            if resp.text:
-                return resp.text.strip()
-            return "DOCUMENT_QUERY"
+            return resp.text.strip() if resp.text else "DOCUMENT_QUERY"
         except Exception as e:
             logger.warning(f"Gemini raw call failed: {e}")
             return "DOCUMENT_QUERY"
@@ -282,60 +305,73 @@ class RAGSystem:
             return "DOCUMENT_QUERY"
 
     # =========================================================================
-    # RETRIEVAL
+    # RETRIEVAL — multi-source aware
+    #
+    # Key change from previous version:
+    # Instead of picking ONE best source and only returning its chunks, we now:
+    #   1. Run a global vector search across ALL user chunks.
+    #   2. Identify ALL sources whose best chunk clears the similarity threshold.
+    #   3. For each qualifying source, fetch its top-k chunks.
+    #   4. Merge and return — the LLM receives context from multiple documents.
+    #
+    # This means a question like "compare the Q1 report and the sales CSV" will
+    # pull relevant chunks from both files rather than arbitrarily choosing one.
     # =========================================================================
 
     def retrieve(self, query: str, google_id: str, k: int = 6) -> list:
         q_emb = self.embed_model.embed_query(query)
         collection = self.db.get_user_collection(google_id)
 
-        # --- Recent source cache ---
+        # --- 1. Recent-source priority cache (within session) ---
         recent_sources = self.get_recent_sources(google_id)
-        print(f"\n[Retrieval] Recent sources in cache: {recent_sources}")
-
         if recent_sources:
             try:
                 res = collection.query(
                     query_embeddings=[q_emb],
-                    n_results=k,
+                    n_results=min(k * 2, 20),
                     where={"source": {"$in": recent_sources}}
                 )
                 docs, best_sim = self._parse_query_results(res, threshold=0.25)
-                if docs and best_sim >= 0.30:
-                    print("[Retrieval] Cache hit — using recent source")
+                if docs and best_sim >= 0.35:
+                    print(f"[Retrieval] Cache hit — sources: {list({d['metadata']['source'] for d in docs})}")
                     return docs
             except Exception as e:
                 logger.warning(f"Cache retrieval failed: {e}")
 
-        # --- All sources ---
+        # --- 2. Filename token match ---
         res_all = collection.get()
         if not res_all or "metadatas" not in res_all:
             return []
 
-        sources = list({
-            m.get("source")
-            for m in res_all["metadatas"]
-            if m.get("source")
+        all_sources = list({
+            m.get("source") for m in res_all["metadatas"] if m.get("source")
         })
 
-        # --- Filename token match (meaningful words only, length > 2) ---
         query_words = set(re.sub(r"[^\w\s]", "", query.lower()).split())
-        for source in sources:
+        filename_matched_docs = []
+        for source in all_sources:
             name_words = set(re.sub(r"[._\-]", " ", source.lower()).split())
-            meaningful_overlap = {w for w in (query_words & name_words) if len(w) > 2}
-            if meaningful_overlap:
-                print(f"[Retrieval] Filename match: '{source}' overlap={meaningful_overlap}")
+            overlap = {w for w in (query_words & name_words) if len(w) > 2}
+            if overlap:
+                print(f"[Retrieval] Filename match: '{source}' overlap={overlap}")
                 res = collection.query(
                     query_embeddings=[q_emb],
                     n_results=k,
                     where={"source": source}
                 )
                 docs, _ = self._parse_query_results(res, threshold=0.10)
-                if docs:
-                    return docs
+                filename_matched_docs.extend(docs)
 
-        # --- Global vector search -> best source reroute ---
-        res = collection.query(query_embeddings=[q_emb], n_results=100)
+        if filename_matched_docs:
+            return filename_matched_docs
+
+        # --- 3. Global vector search → identify ALL qualifying sources ---
+        # Fetch a generous pool of results so we can score every source fairly.
+        pool_size = min(len(res_all.get("ids", [])), 200)
+        if pool_size == 0:
+            return []
+
+        res = collection.query(query_embeddings=[q_emb], n_results=pool_size)
         if not res or "documents" not in res:
             return []
 
@@ -343,25 +379,47 @@ class RAGSystem:
         if not all_hits:
             return []
 
-        source_best: dict = {}
+        # Best similarity score per source
+        source_best: dict[str, float] = {}
         for hit in all_hits:
             src = hit["metadata"].get("source", "")
-            source_best[src] = max(source_best.get(src, 0), hit["score"])
+            source_best[src] = max(source_best.get(src, 0.0), hit["score"])
 
-        best_source = max(source_best, key=source_best.get)
-        best_score = source_best[best_source]
-        print(f"[Retrieval] Global best: '{best_source}' score={best_score:.3f}")
+        RELEVANCE_THRESHOLD = 0.30
+        # Qualify every source that clears the threshold (not just the single best)
+        qualifying_sources = [
+            src for src, score in source_best.items()
+            if score >= RELEVANCE_THRESHOLD
+        ]
 
-        if best_score < 0.30:
+        if not qualifying_sources:
+            # Nothing clears the threshold — return top-k global hits anyway
+            print("[Retrieval] No source cleared threshold, returning top-k global hits")
             return sorted(all_hits, key=lambda x: x["score"], reverse=True)[:k]
 
-        res_source = collection.query(
-            query_embeddings=[q_emb],
-            n_results=k,
-            where={"source": best_source}
-        )
-        docs, _ = self._parse_query_results(res_source, threshold=0.15)
-        return docs
+        print(f"[Retrieval] Qualifying sources: {qualifying_sources}")
+
+        # --- 4. For each qualifying source, fetch its top-k chunks ---
+        # Distribute k evenly across sources (at least 2 chunks per source).
+        chunks_per_source = max(2, k // len(qualifying_sources))
+        merged_docs = []
+
+        for src in qualifying_sources:
+            self.update_recent_sources(google_id, src)
+            try:
+                res_src = collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=chunks_per_source,
+                    where={"source": src}
+                )
+                src_docs, _ = self._parse_query_results(res_src, threshold=0.15)
+                # Sort by chunk_index for coherent reading order
+                src_docs.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
+                merged_docs.extend(src_docs)
+            except Exception as e:
+                logger.warning(f"Per-source retrieval failed for '{src}': {e}")
+
+        return merged_docs
 
     def _parse_query_results(self, res: dict, threshold: float) -> tuple:
         docs = []
@@ -380,13 +438,13 @@ class RAGSystem:
         return docs, best_sim
 
     # =========================================================================
-    # LLM CALLS
+    # LLM CALLS  (all now accept history)
     # =========================================================================
 
-    def call_gemini(self, question: str, context: str, max_tokens: int = 1000) -> str:
+    def call_gemini(self, question: str, context: str, history: list[dict], max_tokens: int = 1000) -> str:
         if not self.api_key:
             return "Gemini API key missing."
-        prompt = _get_prompt(GEMINI_PROMPT, context, question)
+        prompt = _get_prompt(GEMINI_PROMPT, context, question, history)
         mdl = genai.GenerativeModel(self.model_name)
         for attempt in range(3):
             try:
@@ -404,13 +462,13 @@ class RAGSystem:
                 return f"Error calling Gemini API: {e}"
         return "Gemini rate limit exceeded. Please try again later."
 
-    def call_ollama(self, question: str, context: str, model: str = "ollama") -> str:
+    def call_ollama(self, question: str, context: str, history: list[dict], model: str = "ollama") -> str:
         if model == "deepseek":
             ollama_model = "deepseek-r1:1.5b"
-            prompt = _get_prompt(DEEPSEEK_PROMPT, context, question)
+            prompt = _get_prompt(DEEPSEEK_PROMPT, context, question, history)
         else:
             ollama_model = "llama3.2:1b-instruct-q4_K_M"
-            prompt = _get_prompt(LLAMA_PROMPT, context, question)
+            prompt = _get_prompt(LLAMA_PROMPT, context, question, history)
 
         try:
             response = requests.post(
@@ -436,14 +494,14 @@ class RAGSystem:
             logger.error(f"Ollama error: {e}")
             return f"Ollama error: {e}"
 
-    def generate(self, question: str, context: str, model: str = "gemini") -> str:
+    def generate(self, question: str, context: str, history: list[dict], model: str = "gemini") -> str:
         """Route to the right LLM with its model-specific prompt."""
         if model == "gemini":
-            return self.call_gemini(question, context)
+            return self.call_gemini(question, context, history)
         elif model == "deepseek":
-            return self.call_ollama(question, context, model="deepseek")
+            return self.call_ollama(question, context, history, model="deepseek")
         elif model in ("ollama", "llama"):
-            return self.call_ollama(question, context, model="ollama")
+            return self.call_ollama(question, context, history, model="ollama")
         return "Unknown model selected."
 
     # =========================================================================
@@ -452,7 +510,7 @@ class RAGSystem:
 
     def find_and_load_best_csv(self, question: str, google_id: str) -> tuple:
         """
-        Find the most semantically relevant CSV for the query, not just any CSV.
+        Find the most semantically relevant CSV for the query.
         Returns (DataFrame, source_name) or (None, None).
         """
         collection = self.db.get_user_collection(google_id)
@@ -526,7 +584,7 @@ class RAGSystem:
             logger.warning(f"CSV load failed for {best_source}: {e}")
             return None, best_source
 
-    def build_dataset_context(self, df: pd.DataFrame, source: str) -> str:
+    def build_dataset_context(self, df, source: str) -> str:
         """Build a compact, LLM-readable statistical summary."""
         import numpy as np
 
@@ -558,35 +616,37 @@ class RAGSystem:
         return "\n".join(parts)
 
     # =========================================================================
-    # MAIN RAG PIPELINE
+    # MAIN RAG PIPELINE  — now history-aware + multi-source
     # =========================================================================
 
-    def answer(self, question: str, google_id: str, top_k: int, model: str = "gemini") -> dict:
+    def answer(self, question: str, google_id: str, top_k: int, model: str = "gemini",
+               history: list[dict] = None) -> dict:
+        """
+        history: list of {"role": "user"|"assistant", "text": "..."} dicts,
+                 ordered oldest→newest. Passed in from MongoDB by the /query endpoint.
+        """
+        if history is None:
+            history = []
+
         if not question or not question.strip():
-            return {
-                "answer": "Question cannot be empty.",
-                "sources": [],
-                "retrieved_count": 0,
-                "eval": {}
-            }
+            return {"answer": "Question cannot be empty.", "sources": [], "retrieved_count": 0, "eval": {}}
 
         pipeline_start = time.time()
 
         # ------------------------------------------------------------------
-        # STEP 1: LLM-based intent classification
+        # STEP 1: LLM-based intent classification (now history-aware)
         # ------------------------------------------------------------------
         intent_start = time.time()
-        intent = self.classify_intent(question, google_id, model)
+        intent = self.classify_intent(question, google_id, model, history)
         intent_latency = time.time() - intent_start
         print(f"[Pipeline] Intent={intent} ({intent_latency:.2f}s via {model})")
 
         # ------------------------------------------------------------------
         # STEP 2: Route by intent
         # ------------------------------------------------------------------
-
         if intent == "SMALLTALK":
             gen_start = time.time()
-            answer_text = self.generate(question, "", model)
+            answer_text = self.generate(question, "", history, model)
             gen_latency = time.time() - gen_start
             return self._build_response(
                 answer=answer_text, sources=[], retrieved_count=0,
@@ -600,7 +660,7 @@ class RAGSystem:
             if df is not None and not df.empty:
                 context = self.build_dataset_context(df, csv_source)
                 gen_start = time.time()
-                answer_text = self.generate(question, context, model)
+                answer_text = self.generate(question, context, history, model)
                 gen_latency = time.time() - gen_start
                 return self._build_response(
                     answer=answer_text,
@@ -610,12 +670,11 @@ class RAGSystem:
                     intent_latency=intent_latency, gen_latency=gen_latency,
                     total_latency=time.time() - pipeline_start
                 )
-            # No relevant CSV — fall through to document retrieval
             print("[Pipeline] DATASET_QUERY but no relevant CSV — falling back to document retrieval")
             intent = "DOCUMENT_QUERY"
 
         # ------------------------------------------------------------------
-        # STEP 3: Document retrieval
+        # STEP 3: Multi-source document retrieval
         # ------------------------------------------------------------------
         ret_start = time.time()
         retrieved_docs = self.retrieve(question, google_id, k=top_k)
@@ -624,7 +683,7 @@ class RAGSystem:
 
         if not retrieved_docs:
             gen_start = time.time()
-            answer_text = self.generate(question, "", model)
+            answer_text = self.generate(question, "", history, model)
             gen_latency = time.time() - gen_start
             return self._build_response(
                 answer=answer_text, sources=[], retrieved_count=0,
@@ -635,38 +694,47 @@ class RAGSystem:
             )
 
         # ------------------------------------------------------------------
-        # STEP 4: Select best source, build shared context
+        # STEP 4: Build multi-source context
+        #
+        # Group chunks by source, sort each group by chunk_index for
+        # coherent reading order, then concatenate with clear source headers.
+        # This way the LLM knows which text came from which file.
         # ------------------------------------------------------------------
-        source_counts = Counter(
-            d["metadata"].get("source", "unknown") for d in retrieved_docs
-        )
-        best_source = source_counts.most_common(1)[0][0]
-        self.update_recent_sources(google_id, best_source)
+        from collections import defaultdict
+        source_chunks: dict = defaultdict(list)
+        for d in retrieved_docs:
+            src = d["metadata"].get("source", "unknown")
+            source_chunks[src].append(d)
 
-        docs = sorted(
-            [d for d in retrieved_docs if d["metadata"].get("source") == best_source],
-            key=lambda x: x["metadata"].get("chunk_index", 0)
-        )
+        # Sort each source's chunks by chunk_index
+        for src in source_chunks:
+            source_chunks[src].sort(key=lambda x: x["metadata"].get("chunk_index", 0))
 
-        # All models get the SAME context — fair comparison
-        context = f"Source document: {best_source}\n\n" + "\n\n".join(d["text"] for d in docs)
-        print(f"[Pipeline] Context: {len(docs)} chunks, {len(context)} chars from '{best_source}'")
+        # Build context block with clear per-source headers
+        context_parts = []
+        sources_out = []
+        for src, chunks in source_chunks.items():
+            context_parts.append(f"=== Source: {src} ===")
+            context_parts.append("\n".join(c["text"] for c in chunks))
+            sources_out.append({
+                "filename": src,
+                "snippet": chunks[0]["text"][:200] if chunks else ""
+            })
+
+        context = "\n\n".join(context_parts)
+        print(f"[Pipeline] Context: {len(retrieved_docs)} chunks from {len(source_chunks)} source(s): "
+              f"{list(source_chunks.keys())}")
 
         # ------------------------------------------------------------------
-        # STEP 5: Generate
+        # STEP 5: Generate with history + multi-source context
         # ------------------------------------------------------------------
         gen_start = time.time()
-        answer_text = self.generate(question, context, model)
+        answer_text = self.generate(question, context, history, model)
         gen_latency = time.time() - gen_start
 
-        sources = [{
-            "filename": best_source,
-            "snippet": docs[0]["text"][:200] if docs else ""
-        }]
-
         return self._build_response(
-            answer=answer_text, sources=sources,
-            retrieved_count=len(docs), context_chars=len(context),
+            answer=answer_text, sources=sources_out,
+            retrieved_count=len(retrieved_docs), context_chars=len(context),
             intent=intent, model=model,
             intent_latency=intent_latency, gen_latency=gen_latency,
             total_latency=time.time() - pipeline_start,
@@ -674,7 +742,7 @@ class RAGSystem:
         )
 
     # =========================================================================
-    # RESPONSE BUILDER — eval metadata attached to every response
+    # RESPONSE BUILDER
     # =========================================================================
 
     def _build_response(
@@ -690,10 +758,6 @@ class RAGSystem:
         total_latency: float,
         retrieval_latency: float = 0.0,
     ) -> dict:
-        """
-        Attaches an 'eval' block to every response so your frontend/logger
-        can record and compare models across latency, context size, and intent.
-        """
         return {
             "answer": answer,
             "sources": sources,

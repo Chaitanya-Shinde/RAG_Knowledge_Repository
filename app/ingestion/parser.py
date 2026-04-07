@@ -9,7 +9,7 @@ import pytesseract
 import io
 import logging
 
-pytesseract.tesseract_cmd = (
+pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 

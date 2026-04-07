@@ -280,6 +280,9 @@ class RAGSystem:
                 prompt,
                 generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens)
             )
+            # Check if response was blocked due to safety
+            if resp.candidates and resp.candidates[0].finish_reason == 2:  # SAFETY
+                return "0.5"  # Default score for evaluation
             return resp.text.strip() if resp.text else "DOCUMENT_QUERY"
         except Exception as e:
             logger.warning(f"Gemini raw call failed: {e}")
@@ -500,7 +503,7 @@ class RAGSystem:
             return self.call_gemini(question, context, history)
         elif model == "deepseek":
             return self.call_ollama(question, context, history, model="deepseek")
-        elif model in ("ollama", "llama"):
+        elif model.startswith("llama") or model in ("ollama", "llama"):
             return self.call_ollama(question, context, history, model="ollama")
         return "Unknown model selected."
 
@@ -652,7 +655,7 @@ class RAGSystem:
                 answer=answer_text, sources=[], retrieved_count=0,
                 context_chars=0, intent=intent, model=model,
                 intent_latency=intent_latency, gen_latency=gen_latency,
-                total_latency=time.time() - pipeline_start
+                total_latency=time.time() - pipeline_start, context=""
             )
 
         if intent == "DATASET_QUERY":
@@ -668,7 +671,7 @@ class RAGSystem:
                     retrieved_count=0, context_chars=len(context),
                     intent=intent, model=model,
                     intent_latency=intent_latency, gen_latency=gen_latency,
-                    total_latency=time.time() - pipeline_start
+                    total_latency=time.time() - pipeline_start, context=context
                 )
             print("[Pipeline] DATASET_QUERY but no relevant CSV — falling back to document retrieval")
             intent = "DOCUMENT_QUERY"
@@ -690,7 +693,7 @@ class RAGSystem:
                 context_chars=0, intent=intent, model=model,
                 intent_latency=intent_latency, gen_latency=gen_latency,
                 total_latency=time.time() - pipeline_start,
-                retrieval_latency=ret_latency
+                retrieval_latency=ret_latency, context=""
             )
 
         # ------------------------------------------------------------------
@@ -738,7 +741,7 @@ class RAGSystem:
             intent=intent, model=model,
             intent_latency=intent_latency, gen_latency=gen_latency,
             total_latency=time.time() - pipeline_start,
-            retrieval_latency=ret_latency
+            retrieval_latency=ret_latency, context=context
         )
 
     # =========================================================================
@@ -757,11 +760,13 @@ class RAGSystem:
         gen_latency: float,
         total_latency: float,
         retrieval_latency: float = 0.0,
+        context: str = "",
     ) -> dict:
         return {
             "answer": answer,
             "sources": sources,
             "retrieved_count": retrieved_count,
+            "context": context,  # Include context for evaluation
             "eval": {
                 "model": model,
                 "intent": intent,

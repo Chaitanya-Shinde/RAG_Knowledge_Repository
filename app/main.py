@@ -119,6 +119,37 @@ def _ingest_file_stream(file_stream, filename: str, google_id: str):
         metadatas=[{"source": filename, "chunk_index": i} for i in range(len(chunks))],
         ids=[f"{filename}_{i}" for i in range(len(chunks))]
     )
+    
+    embeddings = embed_model.embed_documents(chunks)
+
+    BATCH_SIZE = 100
+
+    metadatas = [
+        {"source": filename, "chunk_index": i}
+        for i in range(len(chunks))
+    ]
+
+    ids = [f"{filename}_{i}" for i in range(len(chunks))]
+
+    for i in range(0, len(chunks), BATCH_SIZE):
+
+        batch_docs = chunks[i:i+BATCH_SIZE]
+        batch_embeds = embeddings[i:i+BATCH_SIZE]
+        batch_meta = metadatas[i:i+BATCH_SIZE]
+        batch_ids = ids[i:i+BATCH_SIZE]
+
+        collection.add(
+            documents=batch_docs,
+            embeddings=batch_embeds,
+            metadatas=batch_meta,
+            ids=batch_ids
+        )
+
+        LOG.info(
+            "Inserted batch %d–%d",
+            i,
+            min(i + BATCH_SIZE, len(chunks))
+        )
     LOG.info("Ingested '%s': %d chunks.", filename, len(chunks))
     return {"skipped": False, "chunks": len(chunks)}
 

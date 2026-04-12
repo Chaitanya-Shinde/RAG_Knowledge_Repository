@@ -10,6 +10,7 @@ import pandas as pd
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
 
 from .embeddings import EmbeddingModel
 from .db_client import ChromaClient
@@ -55,7 +56,8 @@ INSTRUCTIONS:
 - Do not explain your reasoning unless the user explicitly asks.
 - Combine information across multiple document chunks and sources if needed.
 - For numeric/dataset questions, return concrete values, not templates or SQL.
-- Be direct and concise."""
+- Be direct and concise.
+- Dont hide personal information."""
 
 # --- Llama 3.2 1B: ultra-short, single directive ---
 LLAMA_PROMPT = """Previous conversation:
@@ -85,6 +87,8 @@ If the answer is not in the context, say "Not found in documents."
 Do not reason out loud. Give a direct answer only.
 Use your Reasoning to generate answers.
 Do not show thinking.
+Dont hide personal information.
+
 
 Question: {question}
 Answer:"""
@@ -308,7 +312,96 @@ class RAGSystem:
             return "DOCUMENT_QUERY"
 
     # =========================================================================
-    # RETRIEVAL — multi-source aware
+    # JUDGE LLM CALL  (evaluation only — isolated from intent pipeline)
+    #
+    # WHY A SEPARATE METHOD?
+    # _call_llm_raw is designed for intent classification: tiny token budget,
+    # fallback of "DOCUMENT_QUERY", temperature 0. When used as a judge it
+    # produces "DOCUMENT_QUERY" instead of a numeric score.
+    #
+    # This method is purpose-built for scoring: higher token budget so the
+    # model can output a decimal, neutral fallback of "0.5", and a clean
+    # single-turn stateless call with no caching or intent routing.
+    # =========================================================================
+
+    def _call_judge_llm(self, prompt: str, model: str) -> str:
+        """
+        Call an LLM as a judge to score answer quality.
+        Returns a string containing a float between 0 and 1.
+        Falls back to "0.5" (neutral) on any failure.
+
+        Completely isolated from _call_llm_raw / intent pipeline.
+        Uses a higher token budget (50) so models can output decimals reliably.
+        """
+        if model == "gemini":
+            return self._gemini_judge(prompt)
+        elif model == "deepseek":
+            return self._ollama_judge(prompt, "deepseek-r1:1.5b")
+        else:
+            return self._ollama_judge(prompt, "llama3.2:1b-instruct-q4_K_M")
+
+    def _gemini_judge(self, prompt: str) -> str:
+        if not self.api_key:
+            return "0.5"
+        try:
+            mdl = genai.GenerativeModel(self.model_name)
+            resp = mdl.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(max_output_tokens=50)
+            )
+            if resp.candidates and resp.candidates[0].finish_reason == 2:  # SAFETY
+                return "0.5"
+            return resp.text.strip() if resp.text else "0.5"
+        except Exception as e:
+            logger.warning(f"Gemini judge call failed: {e}")
+            return "0.5"
+
+    def _ollama_judge(self, prompt: str, ollama_model: str) -> str:
+        # DeepSeek-R1 is a thinking model: it emits <think>...</think> reasoning
+        # tokens BEFORE the actual answer.  With a small num_predict budget the
+        # model exhausts all tokens inside the think block and never reaches the
+        # numeric score → every call returns "0.5" (the fallback).
+        # Fix: use a generous budget (600) so the model can finish thinking AND
+        # output the score, then strip the think block before returning.
+        is_deepseek = "deepseek" in ollama_model.lower()
+        num_predict = 600 if is_deepseek else 50
+        try:
+            resp = requests.post(
+                "http://localhost:11434/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {
+                        "num_predict": num_predict,
+                        "temperature": 0.0
+                    }
+                },
+                timeout=180
+            )
+            data = resp.json()
+            content = data.get("message", {}).get("content", "").strip()
+
+            # Strip <think>...</think> blocks emitted by DeepSeek-R1 and similar
+            # reasoning models before handing the text to the score parser.
+            if is_deepseek and content:
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                # Also handle unclosed think blocks (model cut off mid-think):
+                # if <think> appears but </think> never closed, the real answer
+                # is likely after the last </think> — if there is none, the model
+                # ran out of tokens inside the block; return raw so parser can try.
+                if "<think>" in content and "</think>" not in content:
+                    # Nothing after closing tag; return whatever is left so the
+                    # regex parser in _parse_judge_score can still find a digit.
+                    content = re.sub(r"<think>.*", "", content, flags=re.DOTALL).strip()
+
+            return content if content else "0.5"
+        except Exception as e:
+            logger.warning(f"Ollama judge call failed: {e}")
+            return "0.5"
+
+    # =========================================================================
+    # RETRIEVAL — multi-source aware with history-aware follow-up handling
     #
     # Key change from previous version:
     # Instead of picking ONE best source and only returning its chunks, we now:
@@ -317,17 +410,46 @@ class RAGSystem:
     #   3. For each qualifying source, fetch its top-k chunks.
     #   4. Merge and return — the LLM receives context from multiple documents.
     #
+    # NEW: If this is a follow-up query (detected via history), prioritize
+    # retrieval from recent sources to maintain conversation context.
+    #
     # This means a question like "compare the Q1 report and the sales CSV" will
     # pull relevant chunks from both files rather than arbitrarily choosing one.
+    # And "ok but just give me topic names" will retrieve from the same document
+    # as the previous query if it's contextually relevant.
     # =========================================================================
 
-    def retrieve(self, query: str, google_id: str, k: int = 6) -> list:
+    def retrieve(self, query: str, google_id: str, k: int = 6, history: list[dict] = None) -> list:
+        if history is None:
+            history = []
+        
         q_emb = self.embed_model.embed_query(query)
         collection = self.db.get_user_collection(google_id)
 
-        # --- 1. Recent-source priority cache (within session) ---
+        # --- 1. Follow-up query detection + recent-source priority cache ---
+        # If this is a follow-up query (probabilistically detected) and we have
+        # recent sources in cache, try to retrieve from those first to maintain context.
+        is_followup = self._is_followup_query(query, history=history)
         recent_sources = self.get_recent_sources(google_id)
-        if recent_sources:
+        
+        if is_followup and recent_sources:
+            print(f"[Retrieval] Follow-up detected. Prioritizing recent sources: {recent_sources}")
+            try:
+                res = collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=min(k * 2, 20),
+                    where={"source": {"$in": recent_sources}}
+                )
+                docs, best_sim = self._parse_query_results(res, threshold=0.25)
+                if docs and best_sim >= 0.35:
+                    print(f"[Retrieval] Follow-up context hit — retrieved {len(docs)} chunks from recent sources")
+                    return docs
+                else:
+                    print(f"[Retrieval] Follow-up query but low similarity (best_sim={best_sim:.3f}) — falling back to global search")
+            except Exception as e:
+                logger.warning(f"Follow-up cache retrieval failed: {e}")
+        elif recent_sources and not is_followup:
+            # Non-follow-up query with recent sources: try cache but be lenient
             try:
                 res = collection.query(
                     query_embeddings=[q_emb],
@@ -423,6 +545,107 @@ class RAGSystem:
                 logger.warning(f"Per-source retrieval failed for '{src}': {e}")
 
         return merged_docs
+
+    # =========================================================================
+    # FOLLOW-UP QUERY DETECTION — Probabilistic Semantic Similarity
+    # =========================================================================
+
+    def _is_followup_query(self, question: str, history: list[dict] = None) -> bool:
+        """
+        Probabilistic follow-up detection using semantic similarity and query characteristics.
+        
+        Instead of hardcoded regex patterns, this uses:
+        1. **Embedding Similarity**: How similar is this query to the previous query?
+        2. **Query Length**: Shorter queries are more likely follow-ups (refinement/filtering)
+        3. **History Presence**: With history + short query = likely follow-up
+        4. **Context Reuse Score**: Does the query reuse words from history?
+        
+        Returns a boolean: True if query is detected as a follow-up with confidence > threshold.
+        
+        Heuristics:
+        - High similarity to previous query: Strong indicator (refinement/elaboration)
+        - Short query + history: Likely follow-up (user narrowing down)
+        - Moderate similarity + low information content: Follow-up pattern
+        """
+        if history is None or len(history) < 2:
+            return False
+        
+        # Extract previous user query from history
+        prev_queries = [msg.get("text", "") for msg in history if msg.get("role") == "user"]
+        if not prev_queries:
+            return False
+        
+        prev_query = prev_queries[-1]
+        
+        # ==== Heuristic 1: Embedding Similarity ====
+        # High semantic similarity to previous query suggests follow-up
+        try:
+            current_emb = self.embed_model.embed_query(question)
+            prev_emb = self.embed_model.embed_query(prev_query)
+            sim_score = cosine_similarity([current_emb], [prev_emb])[0][0]
+        except Exception as e:
+            logger.warning(f"Embedding similarity computation failed: {e}")
+            sim_score = 0.0
+        
+        # If very similar to previous query, it's likely a follow-up
+        if sim_score >= 0.45:
+            print(f"[FollowUp] High semantic similarity ({sim_score:.3f}) → Follow-up detected")
+            return True
+        
+        # ==== Heuristic 2: Query Length ====
+        # Follow-ups tend to be shorter (user refining/narrowing)
+        current_tokens = len(question.split())
+        prev_tokens = len(prev_query.split())
+        
+        # Short query (≤ 7 tokens) + history = likely refinement follow-up
+        is_short = current_tokens <= 7
+        is_significantly_shorter = current_tokens <= (prev_tokens * 0.6 + 2)  # 60% of previous length
+        
+        # ==== Heuristic 3: Context Reuse (Word Overlap) ====
+        # Does current query reuse words from recent history?
+        current_words = set(re.sub(r"[^\w\s]", "", question.lower()).split())
+        prev_words = set(re.sub(r"[^\w\s]", "", prev_query.lower()).split())
+        
+        # Remove common stop-words for cleaner overlap detection
+        stop_words = {
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "is", "are", "was", "be", "have", "do",
+            "what", "how", "when", "where", "why", "who", "can", "could", "would",
+            "should", "will", "might", "must", "may", "you", "i", "we", "me"
+        }
+        
+        meaningful_current = {w for w in current_words if len(w) > 2 and w not in stop_words}
+        meaningful_prev = {w for w in prev_words if len(w) > 2 and w not in stop_words}
+        
+        word_overlap = meaningful_current & meaningful_prev
+        overlap_ratio = len(word_overlap) / max(len(meaningful_current), 1)  # % of current words in previous
+        
+        # ==== Decision Logic (Probabilistic) ====
+        
+        # Case 1: Moderate-to-high similarity + short query = Follow-up
+        if sim_score >= 0.35 and is_short:
+            print(f"[FollowUp] Moderate similarity ({sim_score:.3f}) + short query ({current_tokens} tokens) → Follow-up detected")
+            return True
+        
+        # Case 2: Short query + high word overlap + history = Follow-up
+        if is_short and overlap_ratio >= 0.4:
+            print(f"[FollowUp] Short query + high context reuse ({overlap_ratio:.2%}) → Follow-up detected")
+            return True
+        
+        # Case 3: Significantly shorter query + moderate overlap = Follow-up
+        if is_significantly_shorter and overlap_ratio >= 0.25 and sim_score >= 0.25:
+            print(f"[FollowUp] Query refined (len factor: {(current_tokens/prev_tokens):.1%}) + context reuse → Follow-up detected")
+            return True
+        
+        # Case 4: Very short follow-up refinement patterns like "just names", "in csv", "top 5"
+        if current_tokens <= 5:
+            # Very short phrase with some context overlap is likely a follow-up refinement
+            if overlap_ratio >= 0.15 or word_overlap:
+                print(f"[FollowUp] Minimal query ({current_tokens} tokens) + any context reuse → Follow-up detected")
+                return True
+        
+        return False
+
 
     def _parse_query_results(self, res: dict, threshold: float) -> tuple:
         docs = []
@@ -677,10 +900,10 @@ class RAGSystem:
             intent = "DOCUMENT_QUERY"
 
         # ------------------------------------------------------------------
-        # STEP 3: Multi-source document retrieval
+        # STEP 3: Multi-source document retrieval (now history-aware)
         # ------------------------------------------------------------------
         ret_start = time.time()
-        retrieved_docs = self.retrieve(question, google_id, k=top_k)
+        retrieved_docs = self.retrieve(question, google_id, k=top_k, history=history)
         ret_latency = time.time() - ret_start
         print(f"[Pipeline] Retrieved {len(retrieved_docs)} chunks ({ret_latency:.2f}s)")
 

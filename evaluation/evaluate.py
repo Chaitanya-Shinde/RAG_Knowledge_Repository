@@ -391,6 +391,286 @@ TEST_SET = [
     "relevant_sources": [],
     "difficulty": "hard",
     "type": "negative"
+  },
+  {
+    "query": "What is the make of the car in the auto repair receipt?",
+    "expected_answer": ["Toyota"],
+    "relevant_sources": ["auto_repair_receipt.jpg"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What model of car is mentioned in the auto repair receipt?",
+    "expected_answer": ["Corolla"],
+    "relevant_sources": ["auto_repair_receipt.jpg"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What year is the car in the repair receipt?",
+    "expected_answer": ["2019"],
+    "relevant_sources": ["auto_repair_receipt.jpg"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+  {
+    "query": "What is the total amount charged in the auto repair receipt?",
+    "expected_answer": ["829"],
+    "relevant_sources": ["auto_repair_receipt.jpg"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What service cost the most in the auto repair receipt?",
+    "expected_answer": ["Tire Installation"],
+    "relevant_sources": ["auto_repair_receipt.jpg"],
+    "difficulty": "hard",
+    "type": "ocr"
+  },
+  {
+    "query": "How many items were sold in the Walmart receipt?",
+    "expected_answer": ["25"],
+    "relevant_sources": ["walmart_receipt.jpg"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+  {
+    "query": "What is the subtotal in the Walmart receipt?",
+    "expected_answer": ["93.62"],
+    "relevant_sources": ["walmart_receipt.jpg"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+  {
+    "query": "What is the total amount in the Walmart receipt?",
+    "expected_answer": ["98.21"],
+    "relevant_sources": ["walmart_receipt.jpg"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What tax percentage is applied in the Walmart receipt?",
+    "expected_answer": ["6.750%"],
+    "relevant_sources": ["walmart_receipt.jpg"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+  {
+    "query": "What store name appears on the Walmart receipt?",
+    "expected_answer": ["Walmart"],
+    "relevant_sources": ["walmart_receipt.jpg"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+
+  {
+    "query": "What is a process in operating systems?",
+    "expected_answer": ["program in execution"],
+    "relevant_sources": ["Operating_system.pdf"],
+    "difficulty": "medium",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is the function of CPU scheduling?",
+    "expected_answer": ["allocate cpu"],
+    "relevant_sources": ["Operating_system.pdf"],
+    "difficulty": "medium",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is deadlock in operating systems?",
+    "expected_answer": ["waiting indefinitely"],
+    "relevant_sources": ["Operating_system.pdf"],
+    "difficulty": "hard",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is the role of memory management?",
+    "expected_answer": ["manage memory"],
+    "relevant_sources": ["Operating_system.pdf"],
+    "difficulty": "medium",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is virtual memory used for?",
+    "expected_answer": ["extend memory"],
+    "relevant_sources": ["Operating_system.pdf"],
+    "difficulty": "hard",
+    "type": "conceptual"
+  },
+
+  {
+    "query": "What sector does the HR management document focus on?",
+    "expected_answer": ["Banking"],
+    "relevant_sources": ["396331216-Human-Resource-Management-in-Banking-Sector-in-sbi.pdf"],
+    "difficulty": "easy",
+    "type": "fact"
+  },
+  {
+    "query": "What organization is studied in the HR document?",
+    "expected_answer": ["SBI", "State Bank of India"],
+    "relevant_sources": ["396331216-Human-Resource-Management-in-Banking-Sector-in-sbi.pdf"],
+    "difficulty": "easy",
+    "type": "fact"
+  },
+  {
+    "query": "What does HRM stand for?",
+    "expected_answer": ["Human Resource Management"],
+    "relevant_sources": ["396331216-Human-Resource-Management-in-Banking-Sector-in-sbi.pdf"],
+    "difficulty": "easy",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is recruitment in HRM?",
+    "expected_answer": ["hiring employees"],
+    "relevant_sources": ["396331216-Human-Resource-Management-in-Banking-Sector-in-sbi.pdf"],
+    "difficulty": "medium",
+    "type": "conceptual"
+  },
+  {
+    "query": "What is employee training used for?",
+    "expected_answer": ["skill development"],
+    "relevant_sources": ["396331216-Human-Resource-Management-in-Banking-Sector-in-sbi.pdf"],
+    "difficulty": "medium",
+    "type": "conceptual"
+  },
+
+  {
+    "query": "What city is described in the Mumbai document?",
+    "expected_answer": ["Mumbai"],
+    "relevant_sources": ["Mumbai.pdf"],
+    "difficulty": "easy",
+    "type": "fact"
+  },
+  {
+    "query": "Mumbai is located in which state?",
+    "expected_answer": ["Maharashtra"],
+    "relevant_sources": ["Mumbai.pdf"],
+    "difficulty": "easy",
+    "type": "fact"
+  },
+  {
+    "query": "What is Mumbai known as in the document?",
+    "expected_answer": ["financial capital"],
+    "relevant_sources": ["Mumbai.pdf"],
+    "difficulty": "medium",
+    "type": "fact"
+  },
+  {
+    "query": "What industry is Mumbai famous for?",
+    "expected_answer": ["film industry"],
+    "relevant_sources": ["Mumbai.pdf"],
+    "difficulty": "medium",
+    "type": "fact"
+  },
+  {
+    "query": "What port is mentioned in the Mumbai document?",
+    "expected_answer": ["Mumbai Port"],
+    "relevant_sources": ["Mumbai.pdf"],
+    "difficulty": "hard",
+    "type": "fact"
+  },
+
+  {
+    "query": "What bank issued the uploaded bank statement?",
+    "expected_answer": ["HDFC"],
+    "relevant_sources": ["HDFC BANK STATEMENT-pdf-1.pdf"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What is the currency used in the bank statement?",
+    "expected_answer": ["INR"],
+    "relevant_sources": ["HDFC BANK STATEMENT-pdf-1.pdf"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What type of transactions appear in the bank statement?",
+    "expected_answer": ["debit", "credit"],
+    "relevant_sources": ["HDFC BANK STATEMENT-pdf-1.pdf"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+  {
+    "query": "Does the bank statement contain transaction dates? Answer Yes or No",
+    "expected_answer": ["Yes"],
+    "relevant_sources": ["HDFC BANK STATEMENT-pdf-1.pdf"],
+    "difficulty": "easy",
+    "type": "ocr"
+  },
+  {
+    "query": "What column represents transaction amount in the bank statement?",
+    "expected_answer": ["amount"],
+    "relevant_sources": ["HDFC BANK STATEMENT-pdf-1.pdf"],
+    "difficulty": "medium",
+    "type": "ocr"
+  },
+
+  {
+    "query": "Which month shows the highest sales in the sales dataset?",
+    "expected_answer": ["April"],
+    "relevant_sources": ["sales_data_sample.csv"],
+    "difficulty": "hard",
+    "type": "numeric"
+  },
+  {
+    "query": "What column stores order dates in the sales dataset?",
+    "expected_answer": ["ORDERDATE"],
+    "relevant_sources": ["sales_data_sample.csv"],
+    "difficulty": "medium",
+    "type": "numeric"
+  },
+  {
+    "query": "What is the total number of sales records?",
+    "expected_answer": ["2823"],
+    "relevant_sources": ["sales_data_sample.csv"],
+    "difficulty": "hard",
+    "type": "numeric"
+  },
+  {
+    "query": "Which country appears most frequently in the sales dataset?",
+    "expected_answer": ["USA"],
+    "relevant_sources": ["sales_data_sample.csv"],
+    "difficulty": "hard",
+    "type": "numeric"
+  },
+  {
+    "query": "What product line appears in the sales dataset?",
+    "expected_answer": ["Motorcycles"],
+    "relevant_sources": ["sales_data_sample.csv"],
+    "difficulty": "medium",
+    "type": "numeric"
+  },
+
+  {
+    "query": "Compare total amount between restaurant receipt and auto repair receipt",
+    "expected_answer": ["829"],
+    "relevant_sources": ["restaurant_receipt.jpg", "auto_repair_receipt.jpg"],
+    "difficulty": "hard",
+    "type": "multi_document"
+  },
+  {
+    "query": "Which receipt shows the higher total amount?",
+    "expected_answer": ["auto repair"],
+    "relevant_sources": ["restaurant_receipt.jpg", "auto_repair_receipt.jpg"],
+    "difficulty": "hard",
+    "type": "multi_document"
+  },
+
+  {
+    "query": "What confidential military clearance level is listed?",
+    "expected_answer": ["not found", "unknown"],
+    "relevant_sources": [],
+    "difficulty": "hard",
+    "type": "negative"
+  },
+  {
+    "query": "What secret nuclear launch code is stored in the documents?",
+    "expected_answer": ["not found", "unknown"],
+    "relevant_sources": [],
+    "difficulty": "hard",
+    "type": "negative"
   }
 ]
 
@@ -606,6 +886,12 @@ def compute_retrieval_metrics(rag, test_set, top_k, user_id):
 
         print(f"\n--- Query {qid}/{len(test_set)}: {query[:60]}... ---")
 
+        # ── Fix 5: clear the session source-cache before every independent
+        # evaluation question.  In production chat this cache helps with
+        # follow-up continuity; in evaluation every question is independent
+        # and cross-question bleeding would inflate easy retrieval metrics.
+        rag.reset_session_cache(user_id)
+
         result = rag.answer(
             question=query,
             google_id=user_id,
@@ -663,6 +949,9 @@ def evaluate_model(rag, model_name, test_set, top_k):
         expected = sample["expected_answer"]
 
         print(f"\n--- Query {qid}/{len(test_set)}: {query[:60]}... ---")
+
+        # ── Fix 5: clear session cache so each eval question is independent
+        rag.reset_session_cache(USER_ID)
 
         start = time.time()
         result = rag.answer(

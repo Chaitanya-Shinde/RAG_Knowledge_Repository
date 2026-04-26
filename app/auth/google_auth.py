@@ -102,15 +102,4 @@ def callback(request: Request):
     )
 
     
-    # return {
-    #   "access_token": jwt_token,
-    #   "user": {
-    #       "message": "User authenticated and stored",
-    #       "google_id": google_id,
-    #       "email": email,
-    #       "name": name,
-    #       "folder_id": folder_id
-    #   }
-    # }
-    
     return response

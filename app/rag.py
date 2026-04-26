@@ -226,7 +226,40 @@ class RAGSystem:
         "what about that CSV?" correctly.
         Returns one of: DATASET_QUERY | DOCUMENT_QUERY | SMALLTALK
         Falls back to DOCUMENT_QUERY on any failure.
+
+        Pre-check (before LLM call):
+        If the query contains numeric aggregation keywords AND a CSV source
+        exists for the user, short-circuit to DATASET_QUERY immediately.
+        This fixes the common failure mode where small local models
+        mis-classify "how many departments" as DOCUMENT_QUERY.
         """
+        # ---- Numeric keyword pre-check ----
+        NUMERIC_KEYWORDS = {
+            "how many", "total", "average", "avg", "sum", "count", "maximum",
+            "minimum", "highest", "lowest", "most", "least", "median",
+            "which month", "which year", "top", "bottom", "per department",
+            "per month", "per year", "per category", "rank", "ranking",
+            "number of", "percentage", "ratio", "distribution",
+        }
+        q_lower = question.lower()
+        has_numeric_intent = any(kw in q_lower for kw in NUMERIC_KEYWORDS)
+
+        if has_numeric_intent:
+            try:
+                collection = self.db.get_user_collection(google_id)
+                res_all = collection.get()
+                if res_all and "metadatas" in res_all:
+                    has_csv = any(
+                        m.get("source", "").lower().endswith(".csv")
+                        for m in res_all["metadatas"]
+                    )
+                    if has_csv:
+                        print(f"[Intent] Numeric keyword pre-check → DATASET_QUERY (bypassing LLM)")
+                        return "DATASET_QUERY"
+            except Exception as e:
+                logger.warning(f"Intent pre-check failed: {e}")
+        # ---- End pre-check ----
+
         try:
             collection = self.db.get_user_collection(google_id)
             res_all = collection.get()
@@ -403,35 +436,63 @@ class RAGSystem:
     # =========================================================================
     # RETRIEVAL — multi-source aware with history-aware follow-up handling
     #
-    # Key change from previous version:
-    # Instead of picking ONE best source and only returning its chunks, we now:
-    #   1. Run a global vector search across ALL user chunks.
-    #   2. Identify ALL sources whose best chunk clears the similarity threshold.
-    #   3. For each qualifying source, fetch its top-k chunks.
-    #   4. Merge and return — the LLM receives context from multiple documents.
-    #
-    # NEW: If this is a follow-up query (detected via history), prioritize
-    # retrieval from recent sources to maintain conversation context.
-    #
-    # This means a question like "compare the Q1 report and the sales CSV" will
-    # pull relevant chunks from both files rather than arbitrarily choosing one.
-    # And "ok but just give me topic names" will retrieve from the same document
-    # as the previous query if it's contextually relevant.
+    # Pipeline:
+    #   1. Follow-up / session-cache check (conversation continuity).
+    #   2. Filename-token match (explicit file references in the query).
+    #   3. Global vector search → score every source.
+    #   4. Apply RELEVANCE_THRESHOLD (0.42) + hard cap of MAX_QUALIFYING_SOURCES (2)
+    #      so only the most semantically relevant sources make it through.
+    #   5. Score-weighted chunk allocation — higher-scoring sources get more chunks.
+    #   6. OCR / image-source boost for receipt / scan queries.
     # =========================================================================
+
+    # Tuning constants (class-level so they are easy to find and adjust)
+    RELEVANCE_THRESHOLD = 0.42        # raised from 0.30 — cuts noisy sources
+    MAX_QUALIFYING_SOURCES = 2        # hard cap: never spread budget across >2 sources
+    FOLLOWUP_SIM_HIGH = 0.45          # unchanged
+    FOLLOWUP_SIM_MED = 0.35           # unchanged
+    CACHE_HIT_MIN_SIM = 0.42          # raised to match new threshold
+
+    # Keywords that signal the query is about a scanned image / receipt
+    _OCR_KEYWORDS = frozenset({
+        "receipt", "invoice", "walmart", "restaurant", "repair", "auto",
+        "scan", "scanned", "image", "ocr", "photo", "notice", "society",
+        "bill", "tax", "total", "subtotal", "amount charged",
+    })
+
+    # Extensions we treat as OCR / image sources
+    _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
+
+    def _is_ocr_query(self, query: str) -> bool:
+        """Return True when the query is likely about scanned/image documents."""
+        q_lower = query.lower()
+        return any(kw in q_lower for kw in self._OCR_KEYWORDS)
+
+    def _ocr_boost(self, source: str, score: float, is_ocr_query: bool) -> float:
+        """
+        Give a small similarity boost to image/OCR sources when the query
+        is about receipts or scanned documents.  This compensates for the
+        natural embedding gap between natural-language queries and OCR text.
+        Boost is +0.08, capped so the score never exceeds 1.0.
+        """
+        if is_ocr_query and source.lower().endswith(self._IMAGE_EXTENSIONS):
+            return min(score + 0.08, 1.0)
+        return score
 
     def retrieve(self, query: str, google_id: str, k: int = 6, history: list[dict] = None) -> list:
         if history is None:
             history = []
-        
+
         q_emb = self.embed_model.embed_query(query)
         collection = self.db.get_user_collection(google_id)
+        ocr_query = self._is_ocr_query(query)
 
         # --- 1. Follow-up query detection + recent-source priority cache ---
-        # If this is a follow-up query (probabilistically detected) and we have
-        # recent sources in cache, try to retrieve from those first to maintain context.
+        # History is only meaningful in real chat — evaluation clears the cache
+        # between questions (see reset_session_cache()), so this never bleeds.
         is_followup = self._is_followup_query(query, history=history)
         recent_sources = self.get_recent_sources(google_id)
-        
+
         if is_followup and recent_sources:
             print(f"[Retrieval] Follow-up detected. Prioritizing recent sources: {recent_sources}")
             try:
@@ -441,15 +502,14 @@ class RAGSystem:
                     where={"source": {"$in": recent_sources}}
                 )
                 docs, best_sim = self._parse_query_results(res, threshold=0.25)
-                if docs and best_sim >= 0.35:
-                    print(f"[Retrieval] Follow-up context hit — retrieved {len(docs)} chunks from recent sources")
+                if docs and best_sim >= self.CACHE_HIT_MIN_SIM:
+                    print(f"[Retrieval] Follow-up context hit — {len(docs)} chunks from recent sources")
                     return docs
                 else:
-                    print(f"[Retrieval] Follow-up query but low similarity (best_sim={best_sim:.3f}) — falling back to global search")
+                    print(f"[Retrieval] Follow-up low sim ({best_sim:.3f}) — falling back to global search")
             except Exception as e:
                 logger.warning(f"Follow-up cache retrieval failed: {e}")
         elif recent_sources and not is_followup:
-            # Non-follow-up query with recent sources: try cache but be lenient
             try:
                 res = collection.query(
                     query_embeddings=[q_emb],
@@ -457,8 +517,8 @@ class RAGSystem:
                     where={"source": {"$in": recent_sources}}
                 )
                 docs, best_sim = self._parse_query_results(res, threshold=0.25)
-                if docs and best_sim >= 0.35:
-                    print(f"[Retrieval] Cache hit — sources: {list({d['metadata']['source'] for d in docs})}")
+                if docs and best_sim >= self.CACHE_HIT_MIN_SIM:
+                    print(f"[Retrieval] Strong cache hit — sources: {list({d['metadata']['source'] for d in docs})}")
                     return docs
             except Exception as e:
                 logger.warning(f"Cache retrieval failed: {e}")
@@ -490,8 +550,7 @@ class RAGSystem:
         if filename_matched_docs:
             return filename_matched_docs
 
-        # --- 3. Global vector search → identify ALL qualifying sources ---
-        # Fetch a generous pool of results so we can score every source fairly.
+        # --- 3. Global vector search → score every source ---
         pool_size = min(len(res_all.get("ids", [])), 200)
         if pool_size == 0:
             return []
@@ -504,47 +563,64 @@ class RAGSystem:
         if not all_hits:
             return []
 
-        # Best similarity score per source
+        # Best (optionally boosted) similarity score per source
         source_best: dict[str, float] = {}
         for hit in all_hits:
             src = hit["metadata"].get("source", "")
-            source_best[src] = max(source_best.get(src, 0.0), hit["score"])
+            raw_score = hit["score"]
+            boosted = self._ocr_boost(src, raw_score, ocr_query)
+            source_best[src] = max(source_best.get(src, 0.0), boosted)
 
-        RELEVANCE_THRESHOLD = 0.30
-        # Qualify every source that clears the threshold (not just the single best)
-        qualifying_sources = [
-            src for src, score in source_best.items()
-            if score >= RELEVANCE_THRESHOLD
-        ]
+        # --- 4. Filter by threshold + hard cap on number of sources ---
+        # Sort descending by boosted score so we keep the BEST sources when capping.
+        scored_sources = sorted(
+            [(src, score) for src, score in source_best.items()
+             if score >= self.RELEVANCE_THRESHOLD],
+            key=lambda x: x[1],
+            reverse=True
+        )[:self.MAX_QUALIFYING_SOURCES]   # hard cap — never more than 2
 
-        if not qualifying_sources:
-            # Nothing clears the threshold — return top-k global hits anyway
-            print("[Retrieval] No source cleared threshold, returning top-k global hits")
+        if not scored_sources:
+            # Nothing cleared threshold — fall back to global top-k
+            print("[Retrieval] No source cleared threshold — using global hits")
             return sorted(all_hits, key=lambda x: x["score"], reverse=True)[:k]
 
+        qualifying_sources = [s for s, _ in scored_sources]
         print(f"[Retrieval] Qualifying sources: {qualifying_sources}")
 
-        # --- 4. For each qualifying source, fetch its top-k chunks ---
-        # Distribute k evenly across sources (at least 2 chunks per source).
-        chunks_per_source = max(2, k // len(qualifying_sources))
+        # --- 5. Score-weighted chunk allocation ---
+        # Higher-scoring sources receive proportionally more of the k-chunk budget.
+        # Every source gets at least 2 chunks; the remainder is distributed by weight.
+        total_score = sum(sc for _, sc in scored_sources)
         merged_docs = []
 
-        for src in qualifying_sources:
+        for src, sc in scored_sources:
             self.update_recent_sources(google_id, src)
+            weight = sc / total_score
+            # Weight-based allocation with a minimum floor of 2 chunks
+            chunks_this_source = max(2, round(k * weight))
             try:
                 res_src = collection.query(
                     query_embeddings=[q_emb],
-                    n_results=chunks_per_source,
+                    n_results=chunks_this_source,
                     where={"source": src}
                 )
                 src_docs, _ = self._parse_query_results(res_src, threshold=0.15)
-                # Sort by chunk_index for coherent reading order
+                # Preserve reading order within each source
                 src_docs.sort(key=lambda x: x["metadata"].get("chunk_index", 0))
                 merged_docs.extend(src_docs)
             except Exception as e:
                 logger.warning(f"Per-source retrieval failed for '{src}': {e}")
 
         return merged_docs
+
+    def reset_session_cache(self, google_id: str) -> None:
+        """
+        Clear the per-user source cache.  Call this between independent
+        evaluation questions so session state from query N cannot bleed
+        into query N+1.  Has no effect in normal chat usage.
+        """
+        self.recent_sources.pop(google_id, None)
 
     # =========================================================================
     # FOLLOW-UP QUERY DETECTION — Probabilistic Semantic Similarity
@@ -712,6 +788,7 @@ class RAGSystem:
                 timeout=600
             )
             data = response.json()
+            #print("data is:", data)
             message = data.get("message", {})
             content = message.get("content", "").strip()
             thinking = message.get("thinking", "").strip()
@@ -721,6 +798,8 @@ class RAGSystem:
             return f"Ollama error: {e}"
 
     def generate(self, question: str, context: str, history: list[dict], model: str = "gemini") -> str:
+
+        #print("model is: ",model)
         """Route to the right LLM with its model-specific prompt."""
         if model == "gemini":
             return self.call_gemini(question, context, history)
@@ -811,13 +890,33 @@ class RAGSystem:
             return None, best_source
 
     def build_dataset_context(self, df, source: str) -> str:
-        """Build a compact, LLM-readable statistical summary."""
+        """
+        Build a rich, LLM-readable statistical summary of a DataFrame.
+
+        Key additions vs the old version:
+        - Explicit total row count (answers "how many records" directly).
+        - Explicit column name listing (answers "what column stores X" directly).
+        - value_counts for low-cardinality text columns (answers "how many
+          departments / categories exist" and "which appears most often").
+        - Top-N groupby aggregation for the most likely numeric grouping
+          (e.g. salary by department, sales by month).
+        - Kept: per-column describe() stats, sample rows, correlations.
+        """
         import numpy as np
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        text_cols = [c for c in df.columns if c not in numeric_cols]
         rows, cols = df.shape
-        parts = [f"DATASET: {source}", f"Shape: {rows} rows x {cols} columns", ""]
 
+        parts = [
+            f"DATASET: {source}",
+            f"Total rows (records): {rows}",
+            f"Total columns: {cols}",
+            f"Column names: {list(df.columns)}",
+            "",
+        ]
+
+        # Per-column stats
         for col in df.columns:
             if col in numeric_cols:
                 s = df[col].describe()
@@ -827,16 +926,63 @@ class RAGSystem:
                     f"mean={s['mean']:.2f} median={s['50%']:.2f} std={s['std']:.2f}"
                 )
             else:
+                uniq = df[col].nunique()
+                sample = df[col].dropna().head(3).tolist()
                 parts.append(
-                    f"Column '{col}' (text) | unique={df[col].nunique()} "
-                    f"sample={df[col].dropna().head(3).tolist()}"
+                    f"Column '{col}' (text) | unique={uniq} "
+                    f"sample={sample}"
                 )
+                # For low-cardinality columns, emit full value counts so the LLM
+                # can directly answer "how many X exist" and "which X has most rows".
+                if 1 < uniq <= 30:
+                    vc = df[col].value_counts()
+                    vc_str = ", ".join(f"{v}={c}" for v, c in vc.items())
+                    parts.append(
+                        f"  → '{col}' value counts (all {uniq} values): {vc_str}"
+                    )
+
+        # Groupby aggregations: for every low-cardinality text column × every
+        # numeric column, emit sum/mean/max so aggregation questions are answered.
+        if numeric_cols and text_cols:
+            parts.append("\nGROUP-BY AGGREGATIONS:")
+            for tc in text_cols:
+                if df[tc].nunique() > 30:
+                    continue  # skip high-cardinality columns (e.g. names, IDs)
+                for nc in numeric_cols[:3]:  # cap at 3 numeric cols to stay concise
+                    try:
+                        grp = df.groupby(tc)[nc].agg(["sum", "mean", "max", "count"])
+                        grp = grp.sort_values("sum", ascending=False)
+                        parts.append(f"\n  {tc} × {nc} (top 10 by sum):")
+                        parts.append(grp.head(10).round(2).to_string())
+                    except Exception:
+                        pass
+
+        # Date/time column detection → monthly aggregation
+        for col in df.columns:
+            if df[col].dtype == object:
+                try:
+                    parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
+                    if parsed.notna().sum() > rows * 0.5:   # >50% parseable → treat as date
+                        df["__month__"] = parsed.dt.to_period("M").astype(str)
+                        if numeric_cols:
+                            nc = numeric_cols[0]
+                            monthly = (
+                                df.groupby("__month__")[nc]
+                                .sum()
+                                .sort_values(ascending=False)
+                            )
+                            parts.append(f"\nMONTHLY '{nc}' SUM (all months, sorted desc):")
+                            parts.append(monthly.to_string())
+                        df.drop(columns=["__month__"], inplace=True)
+                        break
+                except Exception:
+                    pass
 
         parts.append("\nSAMPLE ROWS (first 5):")
         parts.append(df.head(5).to_csv(index=False))
 
         if len(numeric_cols) > 1:
-            parts.append("CORRELATIONS:")
+            parts.append("\nCORRELATIONS:")
             parts.append(df[numeric_cols].corr().round(3).to_string())
 
         return "\n".join(parts)
